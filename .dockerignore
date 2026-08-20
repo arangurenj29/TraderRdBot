@@ -1,0 +1,38 @@
+# Credentials and local environment (only safe templates may enter the build context)
+.env
+.env.*
+!.env.example
+!.env.server.example
+
+# Local runtime state and secrets
+.venv/
+venv/
+data/
+.local/
+logs/
+*.log
+*.session
+*.session-*
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# Source-control metadata and developer caches
+.atl/
+.codex/
+.agents/
+.git/
+.github/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.DS_Store
+.idea/
+.vscode/

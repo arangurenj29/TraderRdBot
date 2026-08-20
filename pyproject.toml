@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traderrd-observer"
+version = "0.1.0"
+description = "Local Telegram trading-signal observer and audit trail"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "Telethon>=1.44,<2",
+]
+
+[project.scripts]
+traderrd = "traderrd.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

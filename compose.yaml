@@ -1,0 +1,46 @@
+services:
+  traderrd:
+    build: .
+    image: traderrd:demo
+    env_file:
+      - path: .env.server
+        required: true
+    environment:
+      TRADERRD_DB_PATH: /var/lib/traderrd/traderrd.sqlite3
+      TELEGRAM_SESSION_PATH: /var/lib/traderrd/traderrd
+    volumes:
+      - traderrd_state:/var/lib/traderrd
+    command: ["demo-run", "--no-tui"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "traderrd", "healthcheck", "--database-path", "/var/lib/traderrd/traderrd.sqlite3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 2m
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  telegram-auth:
+    image: traderrd:demo
+    build: .
+    profiles: ["bootstrap"]
+    env_file:
+      - path: .env.server
+        required: true
+    environment:
+      TRADERRD_DB_PATH: /var/lib/traderrd/traderrd.sqlite3
+      TELEGRAM_SESSION_PATH: /var/lib/traderrd/traderrd
+    volumes:
+      - traderrd_state:/var/lib/traderrd
+    command: ["telegram-auth"]
+    stdin_open: true
+    tty: true
+    restart: "no"
+
+volumes:
+  traderrd_state:
+    name: traderrd_state
