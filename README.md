@@ -716,8 +716,8 @@ For normal Demo operation, use one foreground command:
 `demo-run` starts the observer, fresh-signal worker, and lifecycle monitor as
 three supervised child processes. In an interactive terminal it automatically
 opens the full-screen **TraderRd Demo dashboard**: live health and risk state, source/worker
-lag, active and pending orders, expiry, ledger performance by pair, a bounded
-collapsible activity log, and a clearly labelled *hypothetical* TP/SL scenario.
+lag, active and pending orders, expiry, ledger performance by pair, and a clearly
+labelled *hypothetical* TP/SL scenario.
 It uses a calm dark terminal palette when colors are available: cyan for
 hierarchy/Demo boundary, green for healthy and positive P&L, yellow for warning
 risk, and red for stopped or severe drawdown. Non-color terminals keep the same
@@ -727,7 +727,7 @@ Bybit, credential, or database-write call. If stdin/stdout are not interactive
 or `TERM` is unsupported (for example `dumb`), it prints the exact fallback
 reason and continues with visible prefixed logs; this is expected behaviour,
 not a silent dashboard failure. `q` stops all three components
-cleanly; `l` toggles logs; `r` refreshes; the footer lists controls. The
+cleanly; `r` refreshes; the footer lists controls. The
 projection is not a profitability forecast: it only sums existing planned
 TP/SL outcomes and excludes fills, fees, slippage, funding, and future signals.
 `Ctrl-C` also stops all three in a controlled way. It always uses the existing **Bybit Demo Trading

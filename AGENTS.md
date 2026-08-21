@@ -61,8 +61,8 @@ For normal Demo-only operation, use the one visible supervised command:
 
 It starts observer, worker, and monitor in one terminal. In an interactive TTY
 it opens a read-only full-screen dashboard with dominant health/risk, signal
-flow, orders, per-pair performance, hypothetical TP/SL scenarios, and collapsible
-child logs. Use curses color pairs only with graceful monochrome fallback; never
+flow, orders, per-pair performance, and hypothetical TP/SL scenarios. Use curses
+color pairs only with graceful monochrome fallback; never
 write raw ANSI sequences from the TUI. `q` or
 `Ctrl-C` stops all children cleanly; `--no-tui` retains prefixed logs. The TUI
 reads SQLite only and must never make exchange/Telegram calls or write state.
