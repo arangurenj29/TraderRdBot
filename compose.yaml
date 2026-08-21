@@ -10,7 +10,7 @@ services:
       TELEGRAM_SESSION_PATH: /var/lib/traderrd/traderrd
     volumes:
       - traderrd_state:/var/lib/traderrd
-    command: ["demo-run", "--no-tui"]
+    command: ["demo-run", "--no-tui", "--database-path", "/var/lib/traderrd/traderrd.sqlite3"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "traderrd", "healthcheck", "--database-path", "/var/lib/traderrd/traderrd.sqlite3"]
