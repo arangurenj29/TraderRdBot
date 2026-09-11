@@ -238,6 +238,7 @@ class ConfirmPendingFill:
     command_id: str
     occurred_at: datetime
     reservation_id: str
+    mark_equity: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +247,7 @@ class CancelPendingReservation:
     occurred_at: datetime
     reservation_id: str
     reason: str = "operator_cancelled"
+    mark_equity: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +317,10 @@ class PortfolioRiskEngine:
             decision, new_events = self._propose(state, command.proposal, actions)
             events.extend(new_events)
             return RiskTransition(state, decision, tuple(events))
+        if isinstance(command, (ConfirmPendingFill, CancelPendingReservation)) and command.mark_equity is not None:
+            circuit_actions, circuit_events = self._apply_snapshot(state, command.mark_equity, command.occurred_at)
+            actions.extend(circuit_actions)
+            events.extend(circuit_events)
         if isinstance(command, ConfirmPendingFill):
             decision, new_events = self._confirm_fill(state, command.reservation_id)
         elif isinstance(command, CancelPendingReservation):
@@ -333,8 +339,8 @@ class PortfolioRiskEngine:
         else:
             decision, new_events = self._manual_rearm(state, command)
         events.extend(new_events)
-        if actions and not decision.actions:
-            decision = replace(decision, actions=tuple(actions))
+        if actions:
+            decision = replace(decision, actions=tuple(dict.fromkeys((*actions, *decision.actions))))
         return RiskTransition(state, decision, tuple(events))
 
     def _initialize(
@@ -378,9 +384,8 @@ class PortfolioRiskEngine:
                 reservation.status is ReservationStatus.PENDING
                 and reservation.expires_at <= occurred_at
             ):
-                state.reservations[reservation.reservation_id] = replace(
-                    reservation, status=ReservationStatus.EXPIRED
-                )
+                # Expiry requests cancellation; only exchange confirmation can
+                # release the reservation. A fill may race with cancellation.
                 actions.append(self._cancel_action(reservation, "entry_expired"))
                 events.append(
                     RiskEvent(
@@ -447,6 +452,8 @@ class PortfolioRiskEngine:
         events: list[RiskEvent] = []
         if state.mode is not EngineMode.ACTIVE:
             return self._rejected(state.mode.value, actions), events
+        if proposal.symbol in state.reversal_intents:
+            return self._rejected("inverse_confirmation_already_pending", actions), events
         existing_signal = state.reservations.get(proposal.signal_id)
         if existing_signal is not None:
             return self._rejected("duplicate_signal", actions), events
@@ -498,17 +505,15 @@ class PortfolioRiskEngine:
 
         for reservation in same_symbol:
             if reservation.status is ReservationStatus.PENDING:
-                state.reservations[reservation.reservation_id] = replace(
-                    reservation, status=ReservationStatus.CANCELLED
+                state.reversal_intents[proposal.symbol] = ReversalIntent(
+                    reservation.reservation_id,
+                    replace(proposal, entry_expires_at=proposal.entry_expires_at or (
+                        state.as_of + state.policy.pending_entry_ttl)),
                 )
                 actions.append(self._cancel_action(reservation, "inverse_signal"))
-                events.append(
-                    RiskEvent(
-                        "inverse_pending_cancelled",
-                        reservation.reservation_id,
-                        proposal.signal_id,
-                    )
-                )
+                return RiskDecision(
+                    "staged", "cancel_confirmation_required_before_inverse_entry", tuple(actions)
+                ), [RiskEvent("inverse_cancel_requested", reservation.reservation_id, proposal.signal_id)]
         decision, admission_events = self._admit(state, proposal, actions)
         events.extend(admission_events)
         return decision, events
@@ -609,15 +614,21 @@ class PortfolioRiskEngine:
         reservation = state.reservations.get(reservation_id)
         if reservation is None:
             return self._rejected("reservation_not_found"), []
-        if reservation.status is ReservationStatus.FILLED:
+        if reservation.status in {ReservationStatus.FILLED, ReservationStatus.CLOSE_REQUESTED}:
             return RiskDecision("duplicate", "fill_already_confirmed"), []
         if reservation.status is not ReservationStatus.PENDING:
             return self._rejected("reservation_not_pending"), []
-        state.reservations[reservation_id] = replace(
-            reservation, status=ReservationStatus.FILLED
+        reversal = state.reversal_intents.get(reservation.proposal.symbol)
+        must_close = state.mode is EngineMode.KILLED or (
+            reversal is not None and reversal.closing_reservation_id == reservation_id
         )
+        state.reservations[reservation_id] = replace(
+            reservation,
+            status=ReservationStatus.CLOSE_REQUESTED if must_close else ReservationStatus.FILLED,
+        )
+        actions = (self._close_action(reservation, "fill_after_cancel_request"),) if must_close else ()
         return (
-            RiskDecision("accepted", "fill_confirmed", reservation_id=reservation_id),
+            RiskDecision("accepted", "fill_confirmed", actions, reservation_id=reservation_id),
             [RiskEvent("position_filled", reservation_id, "exchange_confirmation")],
         )
 
@@ -644,11 +655,8 @@ class PortfolioRiskEngine:
         state.reservations[reservation_id] = replace(
             reservation, status=ReservationStatus.CANCELLED
         )
-        actions.append(self._cancel_action(reservation, reason))
-        return (
-            RiskDecision("accepted", "pending_cancelled", tuple(actions)),
-            [RiskEvent("pending_cancelled", reservation_id, reason)],
-        )
+        events = [RiskEvent("pending_cancelled", reservation_id, reason)]
+        return self._complete_reversal(state, reservation, actions, events, "pending_cancelled")
 
     def _confirm_close(
         self,
@@ -673,12 +681,22 @@ class PortfolioRiskEngine:
             reservation, status=ReservationStatus.CLOSED
         )
         events = [RiskEvent("position_closed", reservation_id, "exchange_confirmation")]
-        intent = state.reversal_intents.pop(reservation.proposal.symbol, None)
-        if intent is None or state.mode is not EngineMode.ACTIVE:
-            return RiskDecision("accepted", "close_confirmed", tuple(actions)), events
-        decision, admission_events = self._admit(state, intent.proposal, actions)
-        events.extend(admission_events)
-        return decision, events
+        return self._complete_reversal(state, reservation, actions, events, "close_confirmed")
+
+    def _complete_reversal(self, state, reservation, actions, events, reason):
+        intent = state.reversal_intents.get(reservation.proposal.symbol)
+        if intent is None or intent.closing_reservation_id != reservation.reservation_id:
+            return RiskDecision("accepted", reason, tuple(actions)), events
+        state.reversal_intents.pop(reservation.proposal.symbol)
+        if state.mode is EngineMode.ACTIVE:
+            decision, admission_events = self._admit(state, intent.proposal, actions)
+            events.extend(admission_events)
+            if decision.status == "accepted":
+                return decision, events
+            events.append(RiskEvent("inverse_entry_not_admitted", intent.proposal.signal_id, decision.reason))
+        # Cancellation/closure succeeded even when the opposite proposal no
+        # longer passes admission. Never strand the completed exchange handoff.
+        return RiskDecision("accepted", reason, tuple(actions)), events
 
     def _manual_rearm(
         self, state: PortfolioState, command: ManualRearm
@@ -717,9 +735,6 @@ class PortfolioRiskEngine:
         events = [RiskEvent("kill_switch_tripped", None, "fifteen_percent_drawdown")]
         for reservation in state.active_reservations:
             if reservation.status is ReservationStatus.PENDING:
-                state.reservations[reservation.reservation_id] = replace(
-                    reservation, status=ReservationStatus.CANCELLED
-                )
                 actions.append(self._cancel_action(reservation, "drawdown_kill_switch"))
             elif reservation.status is ReservationStatus.FILLED:
                 state.reservations[reservation.reservation_id] = replace(
@@ -733,9 +748,6 @@ class PortfolioRiskEngine:
         actions: list[RiskAction] = []
         for reservation in state.active_reservations:
             if reservation.status is ReservationStatus.PENDING:
-                state.reservations[reservation.reservation_id] = replace(
-                    reservation, status=ReservationStatus.CANCELLED
-                )
                 actions.append(self._cancel_action(reservation, "period_loss_limit"))
         return actions
 
