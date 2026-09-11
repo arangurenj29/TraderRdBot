@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from io import StringIO
 import json
 from pathlib import Path
@@ -12,8 +13,11 @@ from traderrd.application.status import TraderStatusReader, render_status, _comp
 from traderrd.status_cli import _should_color
 from traderrd.cli import main
 from traderrd.domain.parser import SignalParser
+from traderrd.domain.bridge import DemoAccountPosition, DemoStrategyAccountSnapshot
+from traderrd.domain.models import Direction
 from traderrd.infrastructure.bridge_repository import SQLiteDemoBridgeRepository
 from traderrd.infrastructure.heartbeat_repository import SQLiteHeartbeatRepository
+from traderrd.infrastructure.execution_repository import SQLiteDemoExecutionRepository
 from traderrd.infrastructure.sqlite_repository import SQLiteSignalRepository
 from tests.samples import LONG_SIGNAL
 
@@ -273,6 +277,10 @@ class TraderStatusTests(unittest.TestCase):
         self.assertEqual(payload["execution"]["expiry"]["active_entry_count"], 2)
         self.assertEqual(payload["execution"]["expiry"]["expired_entry_count"], 1)
         self.assertEqual(len(payload["execution"]["reconciliation_required"]), 1)
+        self.assertIn(
+            "reconciliation_required",
+            {item["code"] for item in payload["operations"]["attention"]},
+        )
         active = payload["execution"]["active_intents"]
         self.assertEqual({item["symbol"] for item in active}, {"BTCUSDT", "ETHUSDT"})
         self.assertTrue(all("take_profit" in item for item in active))
@@ -309,10 +317,37 @@ class TraderStatusTests(unittest.TestCase):
         self.assertEqual(risk["active_reservations"], 2)
         self.assertEqual(risk["drawdown"]["current_loss_fraction"], "0.15")
         self.assertTrue(risk["drawdown"]["circuit_breaker_latched"])
+        self.assertEqual(payload["operations"]["status"], "blocked")
+        self.assertFalse(payload["operations"]["can_open_new_positions"])
+        self.assertIn("risk_mode_blocked", {item["code"] for item in payload["operations"]["attention"]})
         rendered = render_status(payload)
         self.assertIn("reserved risk: 15", rendered)
         self.assertIn("drawdown 15.00%", rendered)
         self.assertIn("circuit breaker YES", rendered)
+
+    def test_reads_persisted_account_position_metrics_without_exchange_access(self) -> None:
+        repository = SQLiteDemoExecutionRepository(self.database)
+        repository.initialize()
+        repository.record_account_snapshot(DemoStrategyAccountSnapshot(
+            equity=Decimal("1025"), wallet_balance=Decimal("1000"),
+            unrealised_pnl=Decimal("25"), available_balance=Decimal("900"),
+            position_initial_margin=Decimal("90"), order_initial_margin=Decimal("10"),
+            captured_at=NOW - timedelta(seconds=20), orders=(),
+            positions=(DemoAccountPosition(
+                "BTCUSDT", Direction.LONG, Decimal("2"), average_price=Decimal("100"),
+                mark_price=Decimal("105"), liquidation_price=Decimal("50"),
+                unrealised_pnl=Decimal("10"), leverage=Decimal("10"),
+                position_margin=Decimal("20"), take_profit=Decimal("108"),
+                stop_loss=Decimal("97"),
+            ),),
+        ))
+
+        payload = TraderStatusReader(self.database, clock=lambda: NOW).read()
+
+        self.assertEqual(payload["account"]["wallet_balance"], "1000")
+        self.assertEqual(payload["account"]["positions"][0]["mark_price"], "105")
+        self.assertEqual(payload["account"]["positions"][0]["liquidation_price"], "50")
+        self.assertEqual(payload["freshness"]["account_age_seconds"], 20)
 
     def test_performance_is_ledger_only_net_of_fee_without_double_counting(self) -> None:
         SQLiteExecutionForTest(self.database).initialize()

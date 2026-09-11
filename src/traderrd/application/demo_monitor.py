@@ -143,6 +143,7 @@ class DemoLifecycleMonitor:
         for symbol in {intent.symbol for intent in intents}:
             snapshot, rules = self._snapshots.fetch(symbol)
             self._validate_ownership(snapshot)
+            self._execution.record_account_snapshot(snapshot)
             snapshots[symbol] = (snapshot, rules)
 
         risk_updates = 0

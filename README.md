@@ -763,13 +763,24 @@ For normal Demo operation, use one foreground command:
 three supervised child processes. In an interactive terminal it automatically
 opens the full-screen **TraderRd Demo dashboard**: live health and risk state, source/worker
 lag, active and pending orders, expiry, ledger performance by pair, and a clearly
-labelled *hypothetical* TP/SL scenario.
+labelled *hypothetical* TP/SL scenario. System health and trading permission are
+reported separately, so a live process cannot hide a killed/paused risk engine,
+daily or weekly halt, expired entry, reconciliation requirement, or unattributed
+close. Independent ages identify the latest risk, signal, monitor reconciliation,
+and persisted market/account observation; screen refresh is never labelled as
+market freshness.
 It uses a calm dark terminal palette when colors are available: cyan for
 hierarchy/Demo boundary, green for healthy and positive P&L, yellow for warning
 risk, and red for stopped or severe drawdown. Non-color terminals keep the same
 text hierarchy without ANSI escape sequences.
 It refreshes from local SQLite roughly every second and makes no extra Telegram,
-Bybit, credential, or database-write call. If stdin/stdout are not interactive
+Bybit, credential, or database-write call. The lifecycle monitor persists a
+bounded display snapshot containing wallet/equity margin totals and owned-position
+average price, mark price, unrealised P&L, liquidation price, leverage, margin,
+TP, and SL. Missing Bybit fields remain `N/A`; the TUI never estimates them.
+Use `j`/`k` or arrow keys to select exposure, `Enter` for persisted details, and
+`Esc` to close detail/help. Hidden rows are counted explicitly on constrained
+terminals. If stdin/stdout are not interactive
 or `TERM` is unsupported (for example `dumb`), it prints the exact fallback
 reason and continues with visible prefixed logs; this is expected behaviour,
 not a silent dashboard failure. `q` stops all three components
@@ -939,7 +950,10 @@ recent errors. Its stable `performance` object is ledger-only and begins at
 this feature rollout; it never backfills or estimates historic results. It
 reports attributed closed trades by pair, wins/losses/breakeven, win rate
 (excluding breakeven trades), exchange-reported Closed P&L, trading fees, and
-net P&L in USDT, plus unresolved exits. Bybit defines Closed P&L as the final
+net P&L in USDT, plus unresolved exits and explicit first/latest attribution
+coverage. Additive `operations`, `freshness`, and persisted `account` fields
+separate entry permission from process health and expose read-only position
+metrics without contacting Bybit from `status` or the TUI. Bybit defines Closed P&L as the final
 result after opening/closing fees and funding, so `net_pnl` equals the
 exchange-reported Closed P&L; fees are a breakdown and are **not** subtracted a
 second time. See Bybit's [Closed P&L calculation](https://www.bybit.com/en/help-center/article/Profit-Loss-calculations-USDT-Contract)

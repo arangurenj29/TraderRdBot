@@ -102,11 +102,16 @@ class TraderStatusReader:
                 "active_intents": [],
             },
             "risk": _empty_risk(),
+            "account": _empty_account(),
             "performance": _empty_performance(),
+            "operations": _empty_operations(),
+            "freshness": _empty_freshness(),
             "recent_errors": [],
         }
 
         if not self._database_path.is_file():
+            payload["freshness"] = _freshness_snapshot(payload, now)
+            payload["operations"] = _operations_snapshot(payload)
             return payload
 
         try:
@@ -117,6 +122,7 @@ class TraderStatusReader:
                 self._worker_snapshot(connection, payload)
                 payload["execution"] = self._execution_snapshot(connection, now)
                 payload["risk"] = self._risk_snapshot(connection)
+                payload["account"] = self._account_snapshot(connection)
                 payload["performance"] = self._performance_snapshot(connection)
                 payload["recent_errors"] = _recent_errors(heartbeat_events)
         except (OSError, sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
@@ -124,9 +130,14 @@ class TraderStatusReader:
             # fully read. Never expose SQLite details or arbitrary stored text.
             payload["database"]["read_error"] = True
             payload["overall_status"] = "degraded"
+            payload["freshness"] = _freshness_snapshot(payload, now)
+            payload["operations"] = _operations_snapshot(payload)
             return payload
 
         payload["overall_status"] = _overall_status(payload["components"].values())
+        _attach_risk_to_intents(payload)
+        payload["freshness"] = _freshness_snapshot(payload, now)
+        payload["operations"] = _operations_snapshot(payload)
         return payload
 
     def _connection(self) -> sqlite3.Connection:
@@ -321,10 +332,13 @@ class TraderStatusReader:
                     future, key=lambda item: item[0]
                 )[1]
 
+        columns = _columns(connection, "demo_execution_intents")
+        filled_quantity = "filled_quantity" if "filled_quantity" in columns else "NULL AS filled_quantity"
         active_intents = connection.execute(
-            """
-            SELECT intent_id, symbol, kind, state, direction, quantity, price,
-                   take_profit, stop_loss, expires_at
+            f"""
+            SELECT intent_id, risk_reservation_id, symbol, kind, state, direction,
+                   quantity, {filled_quantity}, price, take_profit, stop_loss,
+                   expires_at, updated_at
             FROM demo_execution_intents
             WHERE state IN ('planned', 'acknowledged', 'working', 'filled',
                             'protection_verified', 'position_closed_pending')
@@ -335,15 +349,18 @@ class TraderStatusReader:
         result["active_intents"] = [
             {
                 "intent_id": _safe_token(row["intent_id"]),
+                "risk_reservation_id": _safe_token(row["risk_reservation_id"]),
                 "symbol": _safe_token(row["symbol"]),
                 "kind": _safe_token(row["kind"]),
                 "state": _safe_token(row["state"]),
                 "direction": _safe_token(row["direction"]),
                 "quantity": _safe_decimal_text(row["quantity"]),
+                "filled_quantity": _safe_decimal_text(row["filled_quantity"]),
                 "price": _safe_decimal_text(row["price"]),
                 "take_profit": _safe_decimal_text(row["take_profit"]),
                 "stop_loss": _safe_decimal_text(row["stop_loss"]),
                 "expires_at": _safe_timestamp_text(row["expires_at"]),
+                "updated_at": _safe_timestamp_text(row["updated_at"]),
             }
             for row in active_intents
         ]
@@ -369,13 +386,51 @@ class TraderStatusReader:
         return result
 
     @staticmethod
+    def _account_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
+        result = _empty_account()
+        if not _table_exists(connection, "demo_account_snapshots"):
+            return result
+        row = connection.execute(
+            "SELECT * FROM demo_account_snapshots WHERE singleton_id = 1"
+        ).fetchone()
+        if row is None:
+            return result
+        for key in (
+            "equity", "wallet_balance", "unrealised_pnl", "available_balance",
+            "position_initial_margin", "order_initial_margin",
+        ):
+            result[key] = _safe_decimal_text(row[key])
+        result["captured_at"] = _safe_timestamp_text(row["captured_at"])
+        if _table_exists(connection, "demo_position_snapshots"):
+            rows = connection.execute(
+                "SELECT * FROM demo_position_snapshots ORDER BY symbol, direction"
+            ).fetchall()
+            result["positions"] = [
+                {
+                    "symbol": _safe_token(item["symbol"]),
+                    "direction": _safe_token(item["direction"]),
+                    **{
+                        key: _safe_decimal_text(item[key])
+                        for key in (
+                            "quantity", "average_price", "mark_price",
+                            "liquidation_price", "unrealised_pnl", "leverage",
+                            "position_margin", "take_profit", "stop_loss",
+                        )
+                    },
+                    "captured_at": _safe_timestamp_text(item["captured_at"]),
+                }
+                for item in rows
+            ]
+        return result
+
+    @staticmethod
     def _performance_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
         result = _empty_performance()
         if not _table_exists(connection, "demo_performance_outcomes"):
             return result
         rows = connection.execute(
             """
-            SELECT symbol, closed_pnl, open_fee, close_fee
+            SELECT symbol, closed_at, closed_pnl, open_fee, close_fee
             FROM demo_performance_outcomes
             WHERE status = 'attributed'
             ORDER BY symbol, closed_at, risk_reservation_id
@@ -386,6 +441,7 @@ class TraderStatusReader:
         ).fetchone()
         result["unresolved_exit_count"] = int(unresolved["count"])
         overall = _empty_performance_totals()
+        closed_dates: list[datetime] = []
         pairs: dict[str, dict[str, Any]] = {}
         for row in rows:
             pnl = _decimal_value(row["closed_pnl"])
@@ -398,11 +454,21 @@ class TraderStatusReader:
             pair = pairs.setdefault(str(row["symbol"]), _empty_performance_totals())
             _add_performance_outcome(overall, pnl, open_fee + close_fee)
             _add_performance_outcome(pair, pnl, open_fee + close_fee)
+            closed_at = _parse_timestamp(row["closed_at"])
+            if closed_at is not None:
+                closed_dates.append(closed_at)
         result["pairs"] = [
             {"symbol": symbol, **_finalize_performance_totals(totals)}
             for symbol, totals in sorted(pairs.items())
         ]
         result["overall"] = _finalize_performance_totals(overall)
+        result["coverage"] = {
+            "first_attributed_close_at": min(closed_dates).isoformat() if closed_dates else None,
+            "latest_attributed_close_at": max(closed_dates).isoformat() if closed_dates else None,
+            "attributed_exit_count": result["overall"]["closed_trades"],
+            "unresolved_exit_count": result["unresolved_exit_count"],
+            "complete": result["unresolved_exit_count"] == 0,
+        }
         return result
 
     @staticmethod
@@ -458,6 +524,14 @@ class TraderStatusReader:
                         active_risk_valid = False
                     elif active_risk_valid:
                         active_risk += reserved_risk
+                    proposal = reservation.get("proposal")
+                    result["active_reservation_details"].append({
+                        "reservation_id": _safe_token(reservation.get("reservation_id")),
+                        "status": status,
+                        "symbol": _safe_token(proposal.get("symbol")) if isinstance(proposal, dict) else "",
+                        "direction": _safe_token(proposal.get("direction")) if isinstance(proposal, dict) else "",
+                        "reserved_risk": _safe_decimal_text(reservation.get("reserved_risk")),
+                    })
             result["reservation_counts"] = counts
             result["active_reservations"] = active_count
             result["reserved_risk"] = (
@@ -539,6 +613,29 @@ def render_status(payload: dict[str, Any], *, color: bool = False) -> str:
             line += f" · {paint.warning('investigate before restarting')}"
         lines.append(line)
 
+    operations = payload.get("operations", _empty_operations())
+    lines.extend(["", paint.section("OPERATIONS")])
+    operation_status = str(operations.get("status", "not_ready"))
+    lines.append(
+        "  Trading: " + (
+            paint.danger(operation_status.upper())
+            if operation_status == "blocked"
+            else paint.warning(operation_status.upper())
+            if operation_status != "ready"
+            else paint.health("READY", "healthy")
+        )
+    )
+    for item in operations.get("attention", [])[:5]:
+        lines.append("  " + paint.warning(f"ACTION REQUIRED: {item['message']}"))
+
+    freshness = payload.get("freshness", _empty_freshness())
+    lines.append(
+        "  Freshness: risk " + _display_age(freshness.get("risk_age_seconds"))
+        + " · signal " + _display_age(freshness.get("signal_age_seconds"))
+        + " · reconciliation " + _display_age(freshness.get("monitor_age_seconds"))
+        + " · market " + _display_age(freshness.get("account_age_seconds"))
+    )
+
     lines.extend(["", paint.section("SIGNAL FLOW")])
     source = payload["source"]["latest_signal"]
     if source is None:
@@ -597,6 +694,16 @@ def render_status(payload: dict[str, Any], *, color: bool = False) -> str:
         )
         danger = risk["mode"] == "killed" or bool(risk["daily_halted"]) or bool(risk["weekly_halted"])
         lines.append("  Controls: " + (paint.danger(controls) if danger else controls))
+
+    account = payload.get("account", _empty_account())
+    if account.get("captured_at"):
+        lines.append(
+            "  Account: wallet " + _display_decimal(account.get("wallet_balance"))
+            + " USDT · uPnL " + _display_decimal(account.get("unrealised_pnl"))
+            + " USDT · available " + _display_decimal(account.get("available_balance"))
+            + " USDT · position margin " + _display_decimal(account.get("position_initial_margin"))
+            + " USDT"
+        )
 
     performance = payload["performance"]
     total = performance["overall"]
@@ -807,11 +914,38 @@ def _empty_risk() -> dict[str, Any]:
         "active_reservations": 0,
         "reserved_risk": None,
         "reservation_counts": {status: 0 for status in _KNOWN_RESERVATION_STATES},
+        "active_reservation_details": [],
         "drawdown": {
             "current_loss_fraction": None,
             "circuit_breaker_latched": None,
         },
         "policy": None,
+    }
+
+
+def _empty_account() -> dict[str, Any]:
+    return {
+        "captured_at": None,
+        "equity": None,
+        "wallet_balance": None,
+        "unrealised_pnl": None,
+        "available_balance": None,
+        "position_initial_margin": None,
+        "order_initial_margin": None,
+        "positions": [],
+    }
+
+
+def _empty_operations() -> dict[str, Any]:
+    return {"status": "not_ready", "can_open_new_positions": None, "attention": []}
+
+
+def _empty_freshness() -> dict[str, Any]:
+    return {
+        "risk_age_seconds": None,
+        "signal_age_seconds": None,
+        "monitor_age_seconds": None,
+        "account_age_seconds": None,
     }
 
 
@@ -826,6 +960,13 @@ def _empty_performance() -> dict[str, Any]:
         "overall": _finalize_performance_totals(_empty_performance_totals()),
         "pairs": [],
         "unresolved_exit_count": 0,
+        "coverage": {
+            "first_attributed_close_at": None,
+            "latest_attributed_close_at": None,
+            "attributed_exit_count": 0,
+            "unresolved_exit_count": 0,
+            "complete": True,
+        },
     }
 
 
@@ -961,6 +1102,107 @@ def _overall_status(statuses: Iterable[dict[str, Any]]) -> str:
     if "degraded" in values or "not_started" in values:
         return "degraded"
     return "healthy"
+
+
+def _attach_risk_to_intents(payload: dict[str, Any]) -> None:
+    details = {
+        item.get("reservation_id"): item
+        for item in payload["risk"].get("active_reservation_details", [])
+    }
+    positions = {
+        (item.get("symbol"), item.get("direction")): item
+        for item in payload["account"].get("positions", [])
+    }
+    for intent in payload["execution"].get("active_intents", []):
+        reservation = details.get(intent.get("risk_reservation_id"), {})
+        intent["reserved_risk"] = reservation.get("reserved_risk")
+        intent["risk_status"] = reservation.get("status")
+        position = positions.get((intent.get("symbol"), intent.get("direction")), {})
+        intent["position"] = {
+            key: position.get(key)
+            for key in (
+                "quantity", "average_price", "mark_price", "liquidation_price",
+                "unrealised_pnl", "leverage", "position_margin", "take_profit",
+                "stop_loss", "captured_at",
+            )
+        } if position else None
+
+
+def _freshness_snapshot(payload: dict[str, Any], now: datetime) -> dict[str, Any]:
+    signal = payload["source"].get("latest_signal") or {}
+    return {
+        "risk_age_seconds": _timestamp_age(payload["risk"].get("as_of"), now),
+        "signal_age_seconds": _timestamp_age(signal.get("telegram_received_at"), now),
+        "monitor_age_seconds": payload["components"]["monitor"].get("age_seconds"),
+        "account_age_seconds": _timestamp_age(payload["account"].get("captured_at"), now),
+    }
+
+
+def _timestamp_age(value: Any, now: datetime) -> float | None:
+    parsed = _parse_timestamp(value)
+    return max(0.0, (now - parsed).total_seconds()) if parsed is not None else None
+
+
+def _operations_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    attention: list[dict[str, str]] = []
+    hard_block = False
+
+    def add(code: str, message: str, *, severity: str = "warning", blocks: bool = False) -> None:
+        nonlocal hard_block
+        attention.append({"code": code, "severity": severity, "message": message})
+        hard_block = hard_block or blocks
+
+    if payload["database"].get("read_error"):
+        add("database_unreadable", "Local status database is unreadable", severity="critical", blocks=True)
+    unhealthy = [
+        name for name, item in payload["components"].items()
+        if item.get("status") != "healthy"
+    ]
+    if unhealthy:
+        add("components_unhealthy", "Runtime component health requires attention", blocks=True)
+    risk = payload["risk"]
+    if not risk.get("initialized"):
+        add("risk_uninitialized", "Risk engine is not initialized", blocks=True)
+    elif risk.get("mode") != "active":
+        add("risk_mode_blocked", f"Risk mode is {_safe_token(risk.get('mode')) or 'unknown'}", severity="critical", blocks=True)
+    if risk.get("daily_halted"):
+        add("daily_halt", "Daily loss halt is active", severity="critical", blocks=True)
+    if risk.get("weekly_halted"):
+        add("weekly_halt", "Weekly loss halt is active", severity="critical", blocks=True)
+    execution = payload["execution"]
+    reconciliation_count = len(execution.get("reconciliation_required", []))
+    if reconciliation_count:
+        add("reconciliation_required", f"{reconciliation_count} execution item(s) require reconciliation", severity="critical", blocks=True)
+    expired = int(execution.get("expiry", {}).get("expired_entry_count") or 0)
+    if expired:
+        add("expired_entries", f"{expired} pending entry order(s) are expired", severity="critical", blocks=True)
+    unresolved = int(payload["performance"].get("unresolved_exit_count") or 0)
+    if unresolved:
+        add("unattributed_closes", f"{unresolved} closed exit(s) lack complete P&L attribution")
+    pending_closes = sum(
+        item.get("state") == "position_closed_pending"
+        for item in execution.get("active_intents", [])
+    )
+    if pending_closes:
+        add("close_attribution_pending", f"{pending_closes} closed position(s) await P&L attribution")
+    account_age = payload["freshness"].get("account_age_seconds")
+    if payload["account"].get("positions") and (account_age is None or account_age > 90):
+        add("position_snapshot_stale", "Persisted position metrics are stale", blocks=False)
+
+    if not payload["database"].get("available") or not risk.get("initialized"):
+        status = "not_ready"
+    elif hard_block:
+        status = "blocked"
+    elif attention:
+        status = "attention"
+    else:
+        status = "ready"
+    attention.sort(key=lambda item: 0 if item["severity"] == "critical" else 1)
+    return {
+        "status": status,
+        "can_open_new_positions": status in {"ready", "attention"},
+        "attention": attention,
+    }
 
 
 def _recent_errors(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:

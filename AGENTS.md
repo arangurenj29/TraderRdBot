@@ -79,6 +79,10 @@ color pairs only with graceful monochrome fallback; never
 write raw ANSI sequences from the TUI. `q` or
 `Ctrl-C` stops all children cleanly; `--no-tui` retains prefixed logs. The TUI
 reads SQLite only and must never make exchange/Telegram calls or write state.
+It must distinguish process health from trading permission, label data-source
+freshness independently from screen refresh, and render unavailable market or
+performance evidence as `N/A`/partial rather than invented zero. Position and
+account metrics may be persisted only by the lifecycle monitor.
 If TTY/TERM capabilities are absent, `demo-run` states the exact reason and
 falls back visibly to prefixed logs. A render exception must cleanly stop all
 children and be surfaced to the operator. It owns a per-database lock and must

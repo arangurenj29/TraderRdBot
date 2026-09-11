@@ -28,9 +28,11 @@ _PAIR_BAD = 4
 
 @dataclass(frozen=True, slots=True)
 class Projection:
-    target_pnl: Decimal
-    stop_pnl: Decimal
+    target_pnl: Decimal | None
+    stop_pnl: Decimal | None
     active_count: int
+    entry_count: int
+    covered_entry_count: int
     available_slots: int | None
 
 
@@ -39,19 +41,20 @@ def projection_from_status(payload: dict[str, Any]) -> Projection:
     target = Decimal("0")
     stop = Decimal("0")
     active = payload.get("execution", {}).get("active_intents", [])
-    for intent in active:
-        if intent.get("kind") != "entry":
-            continue
+    entries = [intent for intent in active if intent.get("kind") == "entry"]
+    covered = 0
+    for intent in entries:
         price = _decimal(intent.get("price"))
-        quantity = _decimal(intent.get("quantity"))
+        quantity = _decimal(intent.get("filled_quantity") or intent.get("quantity"))
         take_profit = _decimal(intent.get("take_profit"))
         stop_loss = _decimal(intent.get("stop_loss"))
         direction = intent.get("direction")
-        if None in (price, quantity, take_profit, stop_loss):
+        if None in (price, quantity, take_profit, stop_loss) or direction not in {"LONG", "SHORT"}:
             continue
         multiplier = Decimal("1") if direction == "LONG" else Decimal("-1")
         target += (take_profit - price) * quantity * multiplier
         stop += (stop_loss - price) * quantity * multiplier
+        covered += 1
     risk = payload.get("risk", {})
     policy = risk.get("policy") or {}
     max_slots = policy.get("max_reservations")
@@ -62,7 +65,11 @@ def projection_from_status(payload: dict[str, Any]) -> Projection:
             available = max(0, int(max_slots) - int(used))
     except (TypeError, ValueError):
         pass
-    return Projection(target, stop, len(active), available)
+    return Projection(
+        target if covered or not entries else None,
+        stop if covered or not entries else None,
+        len(active), len(entries), covered, available,
+    )
 
 
 
@@ -99,7 +106,7 @@ def _decimal(value: Any) -> Decimal | None:
 
 def _money(value: Decimal | Any) -> str:
     parsed = value if isinstance(value, Decimal) else _decimal(value)
-    return "unknown" if parsed is None else f"{parsed:,.2f} USDT"
+    return "N/A" if parsed is None else f"{parsed:,.2f} USDT"
 
 
 class TerminalDashboard:
@@ -123,6 +130,8 @@ class TerminalDashboard:
         self._colors_enabled = False
         self._pulse = False
         self._refreshed_at: datetime | None = None
+        self._selected_intent = 0
+        self._show_detail = False
 
     @staticmethod
     def supported(
@@ -192,6 +201,17 @@ class TerminalDashboard:
             self._refreshed_at = datetime.now()
         elif key == ord("?"):
             self._show_help = not self._show_help
+            self._show_detail = False
+        elif key in (ord("j"), getattr(curses, "KEY_DOWN", -999)):
+            self._selected_intent += 1
+        elif key in (ord("k"), getattr(curses, "KEY_UP", -999)):
+            self._selected_intent = max(0, self._selected_intent - 1)
+        elif key in (10, 13):
+            self._show_detail = not self._show_detail
+            self._show_help = False
+        elif key == 27:
+            self._show_detail = False
+            self._show_help = False
         self._render()
         return not self._quit
 
@@ -209,26 +229,41 @@ class TerminalDashboard:
         payload = self._payload or self._reader.read()
         projection = projection_from_status(payload)
         overall = str(payload.get("overall_status", "unknown"))
-        title_attr = curses.A_BOLD | self._status_attr(overall)
-        self._add(0, 0, f" TRADERRD  ·  {overall.upper()} ", curses.A_REVERSE | title_attr)
+        operations = payload.get("operations", {})
+        operational = str(operations.get("status", "not_ready"))
+        title_status = "stopped" if operational == "blocked" else "degraded" if operational != "ready" else overall
+        title_attr = curses.A_BOLD | self._status_attr(title_status)
+        self._add(0, 0, f" TRADERRD  ·  SYSTEM {overall.upper()}  ·  TRADING {operational.upper()} ", curses.A_REVERSE | title_attr)
         self._add(0, max(0, width - 26), "[ DEMO ONLY · NO MAINNET ]", self._accent_attr() | curses.A_BOLD)
         refreshed = self._refreshed_at.strftime("%H:%M:%S") if self._refreshed_at else "starting"
         pulse = "●" if self._pulse else "○"
-        self._add(1, 1, f"{pulse} LIVE · refreshed {refreshed} · local SQLite read-only", curses.A_DIM | self._accent_attr())
+        freshness = payload.get("freshness", {})
+        self._add(1, 1, f"{pulse} SCREEN {refreshed} · risk {self._age(freshness.get('risk_age_seconds'))} · signal {self._age(freshness.get('signal_age_seconds'))} · reconcile {self._age(freshness.get('monitor_age_seconds'))} · market {self._age(freshness.get('account_age_seconds'))}", curses.A_DIM | self._accent_attr())
         self._divider(2, width)
         if self._show_help:
-            self._add(3, 1, "HELP  q stop all Demo components · r refresh · ? close help", self._accent_attr() | curses.A_BOLD)
+            self._add(3, 1, "HELP  q stop · r refresh · j/k or arrows select · Enter detail · Esc close", self._accent_attr() | curses.A_BOLD)
+        attention = operations.get("attention", [])
+        attention_text = "READY · no operator action required"
+        attention_attr = self._color(_PAIR_GOOD)
+        if attention:
+            first = attention[0]
+            extra = f" · +{len(attention) - 1} more" if len(attention) > 1 else ""
+            attention_text = f"REQUIRES ATTENTION · {first.get('message', first.get('code', 'unknown'))}{extra}"
+            attention_attr = self._color(_PAIR_BAD if first.get("severity") == "critical" else _PAIR_WARN) | curses.A_BOLD
+        attention_row = 4 if self._show_help else 3
+        self._add(attention_row, 1, attention_text, attention_attr)
         components = payload.get("components", {})
         component_text = "  ".join(
             f"{name[:3].upper()} {str(components.get(name, {}).get('status', 'unknown')).upper()} {self._age(components.get(name, {}).get('age_seconds'))}"
             for name in ("observer", "worker", "monitor")
         )
         risk = payload.get("risk", {})
+        account = payload.get("account", {})
         drawdown = risk.get("drawdown", {}).get("current_loss_fraction")
-        health_row = 4 if self._show_help else 3
+        health_row = attention_row + 1
         self._add(health_row, 1, "HEALTH / RISK", self._accent_attr() | curses.A_BOLD)
         self._add(health_row, 17, component_text, self._status_attr(overall))
-        self._add(health_row + 1, 3, f"Equity {_money(risk.get('equity'))}  ·  Reserved {_money(risk.get('reserved_risk'))}  ·  Slots {risk.get('active_reservations', 0)}  ·  Drawdown {_percent(drawdown)}", self._risk_attr(drawdown))
+        self._add(health_row + 1, 3, f"Equity {_money(account.get('equity') or risk.get('equity'))} · Wallet {_money(account.get('wallet_balance'))} · Available {_money(account.get('available_balance'))} · uPnL {_money(account.get('unrealised_pnl'))} · Reserved {_money(risk.get('reserved_risk'))} · DD {_percent(drawdown)}", self._risk_attr(drawdown))
         source = payload.get("source", {}).get("latest_signal")
         signal = "none yet" if not source else f"#{source['message_id']} {source['symbol']} {source['direction']}"
         worker = payload.get("worker", {})
@@ -238,29 +273,57 @@ class TerminalDashboard:
         self._add(signal_row, 15, f"{signal}  ·  lag {worker.get('cursor_lag_messages', '?')}  ·  queued {worker.get('unprocessed_signal_count', '?')}")
         execution = payload.get("execution", {})
         expiry = execution.get("expiry", {})
-        intents = execution.get("active_intents", [])
+        intents = self._display_intents(execution)
+        self._selected_intent = min(self._selected_intent, max(0, len(intents) - 1))
         execution_row = signal_row + 2
-        self._add(execution_row, 1, "EXECUTION", self._accent_attr() | curses.A_BOLD)
-        self._add(execution_row, 15, f"active {len(intents)}  ·  pending {expiry.get('active_entry_count', 0)}  ·  expiry {expiry.get('next_entry_expiry_at') or 'none'}")
+        self._add(execution_row, 1, "EXPOSURE", self._accent_attr() | curses.A_BOLD)
+        self._add(execution_row, 15, f"visible {len(intents)}  ·  pending {expiry.get('active_entry_count', 0)}  ·  expired {expiry.get('expired_entry_count', 0)}")
         row = execution_row + 1
-        max_intent_rows = 2 if height < 24 else 3
-        for intent in intents[:max_intent_rows]:
-            self._add(row, 3, f"{intent.get('symbol')} {intent.get('direction')} · {intent.get('state')} · entry {intent.get('price') or '-'} · TP {intent.get('take_profit') or '-'} · SL {intent.get('stop_loss') or '-'}")
+        if self._show_detail and intents:
+            for line in self._intent_detail_lines(intents[self._selected_intent])[: max(1, height - row - 2)]:
+                self._add(row, 3, line)
+                row += 1
+            self._footer(height, width)
+            screen.refresh()
+            return
+        max_intent_rows = 2 if height < 24 else 4
+        start = min(max(0, self._selected_intent - max_intent_rows + 1), max(0, len(intents) - max_intent_rows))
+        shown = intents[start:start + max_intent_rows]
+        for index, intent in enumerate(shown, start=start):
+            marker = "▶" if index == self._selected_intent else " "
+            position = intent.get("position") or {}
+            direction = {"LONG": "L", "SHORT": "S"}.get(intent.get("direction"), "-")
+            qty = f"{intent.get('filled_quantity') or '-'}/{intent.get('quantity') or '-'}"
+            ttl = self._countdown(intent.get("expires_at"), payload.get("generated_at"))
+            self._add(row, 2, f"{marker} {intent.get('symbol', '-')} {direction} · {intent.get('state', '-')} · qty {qty} · risk {intent.get('reserved_risk') or 'N/A'} · mark {position.get('mark_price') or '-'} · uPnL {position.get('unrealised_pnl') or 'N/A'} · ttl {ttl}")
+            row += 1
+        hidden = len(intents) - len(shown)
+        if hidden:
+            self._add(row, 4, f"{hidden} row(s) outside view · use j/k or arrows", curses.A_DIM)
             row += 1
         performance_row = max(row + 1, 12)
+        footer_row = height - 1
+        if performance_row >= footer_row:
+            self._footer(height, width)
+            screen.refresh()
+            return
         self._divider(performance_row - 1, width)
         performance = payload.get("performance", {}).get("overall", {})
         self._add(performance_row, 1, "PERFORMANCE", self._accent_attr() | curses.A_BOLD)
-        self._add(performance_row, 16, f"net {_money(performance.get('net_pnl'))} · trades {performance.get('closed_trades', 0)} · W/L {performance.get('wins', 0)}/{performance.get('losses', 0)} · win {_percent(performance.get('win_rate'))}", self._pnl_attr(performance.get('net_pnl')))
-        footer_row = height - 1
-        pair_header = performance_row + 1
-        self._add(pair_header, 3, "BY PAIR", curses.A_BOLD)
-        pair_limit = max(1, min(4, footer_row - pair_header - 4))
-        pair_rows = pair_performance_lines(payload, limit=pair_limit)
-        for offset, pair_line in enumerate(pair_rows):
-            self._add(pair_header + 1 + offset, 5, pair_line, self._pnl_attr_from_line(pair_line))
-        projection_row = pair_header + 1 + len(pair_rows)
-        projection_text = f"PROJECTION · HYPOTHETICAL planned TP/SL only: target {_money(projection.target_pnl)} · stop {_money(projection.stop_pnl)} · capacity {projection.available_slots if projection.available_slots is not None else '?'} slots"
+        coverage = payload.get("performance", {}).get("coverage", {})
+        coverage_label = "complete" if coverage.get("complete") else "PARTIAL"
+        self._add(performance_row, 16, f"net {_money(performance.get('net_pnl'))} · trades {performance.get('closed_trades', 0)} · W/L {performance.get('wins', 0)}/{performance.get('losses', 0)} · {coverage_label} · since {self._short_date(coverage.get('first_attributed_close_at'))}", self._pnl_attr(performance.get('net_pnl')))
+        next_row = performance_row + 1
+        projection_row = next_row
+        if footer_row - next_row >= 3:
+            self._add(next_row, 3, "BY PAIR", curses.A_BOLD)
+            pair_limit = min(4, footer_row - next_row - 2)
+            pair_rows = pair_performance_lines(payload, limit=pair_limit)
+            for offset, pair_line in enumerate(pair_rows[:pair_limit]):
+                self._add(next_row + 1 + offset, 5, pair_line, self._pnl_attr_from_line(pair_line))
+            projection_row = next_row + 1 + min(len(pair_rows), pair_limit)
+        completeness = "complete" if projection.covered_entry_count == projection.entry_count else f"PARTIAL {projection.covered_entry_count}/{projection.entry_count}"
+        projection_text = f"PROJECTION · {completeness} planned TP/SL: target {_money(projection.target_pnl)} · stop {_money(projection.stop_pnl)} · capacity {projection.available_slots if projection.available_slots is not None else '?'}"
         self._add(projection_row, 1, projection_text, curses.A_DIM | self._accent_attr())
         self._footer(height, width)
         screen.refresh()
@@ -322,7 +385,46 @@ class TerminalDashboard:
         self._add(row, 1, "─" * max(1, width - 2), self._accent_attr() | curses.A_DIM)
 
     def _footer(self, height: int, width: int) -> None:
-        self._add(height - 1, 1, "q quit all components · r refresh · ? help"[: max(1, width - 2)], curses.A_REVERSE)
+        self._add(height - 1, 1, "q quit · r refresh · j/k select · Enter detail · ? help"[: max(1, width - 2)], curses.A_REVERSE)
+
+    @staticmethod
+    def _display_intents(execution: dict[str, Any]) -> list[dict[str, Any]]:
+        result = list(execution.get("active_intents", []))
+        known = {item.get("intent_id") for item in result}
+        result.extend(item for item in execution.get("reconciliation_required", []) if item.get("intent_id") not in known)
+        return result
+
+    @staticmethod
+    def _intent_detail_lines(intent: dict[str, Any]) -> list[str]:
+        position = intent.get("position") or {}
+        return [
+            f"{intent.get('symbol', '-')} {intent.get('direction', '-')} · {intent.get('kind', '-')} · {intent.get('state', '-')}",
+            f"Planned qty {intent.get('quantity') or '-'} · filled {intent.get('filled_quantity') or '-'} · risk {_money(intent.get('reserved_risk'))} ({intent.get('risk_status') or 'N/A'})",
+            f"Entry {intent.get('price') or '-'} · TP {intent.get('take_profit') or '-'} · SL {intent.get('stop_loss') or '-'} · expires {intent.get('expires_at') or 'N/A'}",
+            f"Average {position.get('average_price') or '-'} · mark {position.get('mark_price') or '-'} · uPnL {_money(position.get('unrealised_pnl'))}",
+            f"Liquidation {position.get('liquidation_price') or 'N/A'} · leverage {position.get('leverage') or 'N/A'}x · margin {_money(position.get('position_margin'))}",
+            f"Exchange TP {position.get('take_profit') or '-'} · SL {position.get('stop_loss') or '-'} · observed {position.get('captured_at') or 'N/A'}",
+        ]
+
+    @staticmethod
+    def _short_date(value: Any) -> str:
+        try:
+            return datetime.fromisoformat(str(value)).strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            return "N/A"
+
+    @staticmethod
+    def _countdown(expires_at: Any, generated_at: Any) -> str:
+        try:
+            expires = datetime.fromisoformat(str(expires_at))
+            generated = datetime.fromisoformat(str(generated_at))
+            seconds = int((expires - generated).total_seconds())
+        except (TypeError, ValueError):
+            return "N/A"
+        if seconds <= 0:
+            return "EXPIRED"
+        minutes = seconds // 60
+        return f"{minutes}m" if minutes < 60 else f"{minutes // 60}h{minutes % 60:02d}m"
 
     def _add(self, row: int, column: int, text: str, attr: int = 0) -> None:
         assert self._screen is not None
@@ -334,9 +436,16 @@ class TerminalDashboard:
     @staticmethod
     def _age(value: Any) -> str:
         try:
-            return f"{int(float(value))}s"
+            seconds = max(0, int(float(value)))
         except (TypeError, ValueError):
-            return "?"
+            return "N/A"
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m"
+        hours = minutes // 60
+        return f"{hours}h" if hours < 48 else f"{hours // 24}d"
 
     @staticmethod
     def _health_attr(status: Any) -> int:

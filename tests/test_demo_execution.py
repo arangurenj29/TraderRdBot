@@ -199,6 +199,11 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
         state = SQLiteRiskStateRepository(self.database_path).load_state()
         self.assertEqual(state.reservations[self.entry.risk_reservation_id].status.value, "filled")
         self.assertGreater(state.total_reserved_risk, 0)
+        with sqlite3.connect(self.database_path) as connection:
+            persisted = connection.execute(
+                "SELECT captured_at, equity FROM demo_account_snapshots WHERE singleton_id = 1"
+            ).fetchone()
+        self.assertEqual(persisted, (snapshot.captured_at.isoformat(), "1000"))
 
     def test_expired_unsent_entry_never_reaches_exchange(self) -> None:
         self.service._clock = lambda: START + timedelta(hours=4)

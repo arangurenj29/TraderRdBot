@@ -378,6 +378,7 @@ class BybitDemoAccountSnapshotProvider:
             {"accountType": "UNIFIED", "coin": "USDT"},
         )
         equity = mark_to_market_usdt_equity(wallet)
+        wallet_metrics = _usdt_wallet_metrics(wallet)
         positions_payload = self._fresh_paginated_request(
             "GET",
             "/v5/position/list",
@@ -432,6 +433,11 @@ class BybitDemoAccountSnapshotProvider:
                 captured_at=captured_at,
                 positions=positions,
                 orders=orders,
+                wallet_balance=wallet_metrics["wallet_balance"],
+                unrealised_pnl=wallet_metrics["unrealised_pnl"],
+                available_balance=wallet_metrics["available_balance"],
+                position_initial_margin=wallet_metrics["position_initial_margin"],
+                order_initial_margin=wallet_metrics["order_initial_margin"],
             ),
             rules,
         )
@@ -518,6 +524,14 @@ class BybitDemoAccountSnapshotProvider:
             symbol=symbol,
             direction=Direction.LONG if side == "Buy" else Direction.SHORT,
             quantity=_decimal(row, "size"),
+            average_price=_optional_metric(row, "avgPrice"),
+            mark_price=_optional_metric(row, "markPrice"),
+            liquidation_price=_optional_metric(row, "liqPrice", zero_is_none=True),
+            unrealised_pnl=_optional_metric(row, "unrealisedPnl", signed=True),
+            leverage=_optional_metric(row, "leverage"),
+            position_margin=_optional_metric(row, "positionIM", zero_is_none=True),
+            take_profit=_optional_metric(row, "takeProfit", zero_is_none=True),
+            stop_loss=_optional_metric(row, "stopLoss", zero_is_none=True),
         )
 
     @staticmethod
@@ -619,6 +633,54 @@ def mark_to_market_usdt_equity(wallet_payload: dict[str, Any]) -> Decimal:
             "equity_unavailable", "Mark-to-market Demo equity is unavailable"
         )
     return derived_equity
+
+
+def _usdt_wallet_metrics(wallet_payload: dict[str, Any]) -> dict[str, Decimal | None]:
+    account = _rows(wallet_payload)[0]
+    coins = account.get("coin")
+    if not isinstance(coins, list):
+        raise DemoExecutionError("malformed_response", "Malformed Demo Trading coin balances")
+    rows = [coin for coin in coins if isinstance(coin, dict) and coin.get("coin") == "USDT"]
+    if len(rows) != 1:
+        raise DemoExecutionError("balance_unavailable", "USDT Demo Trading balance is unavailable")
+    row = rows[0]
+    wallet_balance = _decimal(row, "walletBalance", allow_zero=True)
+    unrealised_pnl = _signed_decimal(row, "unrealisedPnl")
+    margin_fields = ("totalPositionIM", "totalOrderIM", "locked", "bonus")
+    if all(key in row for key in margin_fields):
+        position_margin = _decimal(row, "totalPositionIM", allow_zero=True)
+        order_margin = _decimal(row, "totalOrderIM", allow_zero=True)
+        locked = _decimal(row, "locked", allow_zero=True)
+        bonus = _decimal(row, "bonus", allow_zero=True)
+        available = wallet_balance - position_margin - order_margin - locked - bonus
+        if available < 0:
+            raise DemoExecutionError("balance_unavailable", "Available Demo Trading balance is negative")
+    else:
+        position_margin = order_margin = available = None
+    return {
+        "wallet_balance": wallet_balance,
+        "unrealised_pnl": unrealised_pnl,
+        "available_balance": available,
+        "position_initial_margin": position_margin,
+        "order_initial_margin": order_margin,
+    }
+
+
+def _optional_metric(
+    payload: dict[str, Any], key: str, *, signed: bool = False, zero_is_none: bool = False
+) -> Decimal | None:
+    raw = payload.get(key)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not value.is_finite() or (not signed and value < 0):
+        return None
+    if zero_is_none and value == 0:
+        return None
+    return value
 
 
 def _rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
