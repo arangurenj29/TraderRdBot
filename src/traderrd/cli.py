@@ -50,6 +50,10 @@ def cost_rate(raw: str) -> Decimal:
     return value
 
 
+def _resolve_database_path(raw: str | None) -> str:
+    return raw or os.getenv("TRADERRD_DB_PATH", "data/traderrd.sqlite3")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="traderrd", description="Observe and audit Telegram trading signals"
@@ -294,6 +298,7 @@ def main() -> int:
     } and args.env_file != ".env":
         parser.error("risk commands do not load --env-file")
     if args.command not in {
+        "init-db",
         "reprocess-audit",
         "simulate-history",
         "risk-replay",
@@ -309,9 +314,9 @@ def main() -> int:
         "healthcheck",
     } and args.database_path is not None:
         parser.error(
-            "--database-path is only valid with reprocess-audit, "
+            "--database-path is only valid with init-db, reprocess-audit, "
             "simulate-history, risk-replay, risk-report, demo-execute, "
-            "demo-bridge, demo-reconcile, demo-monitor, demo-worker, status, or healthcheck"
+            "demo-bridge, demo-reconcile, demo-monitor, demo-worker, demo-run, tui, status, or healthcheck"
         )
     if args.command != "demo-run" and args.no_tui:
         parser.error("--no-tui is only valid with demo-run")
@@ -324,7 +329,7 @@ def main() -> int:
     if args.command == "healthcheck":
         from traderrd.health_cli import run_healthcheck
 
-        database_path = args.database_path or "data/traderrd.sqlite3"
+        database_path = _resolve_database_path(args.database_path)
         return run_healthcheck(database_path)
     if args.command == "telegram-auth":
         if args.database_path is not None:
@@ -340,7 +345,7 @@ def main() -> int:
     if args.command in {"risk-replay", "risk-report"}:
         from traderrd.risk_cli import run_risk_replay, run_risk_report
 
-        database_path = args.database_path or "data/traderrd.sqlite3"
+        database_path = _resolve_database_path(args.database_path)
         if args.command == "risk-report":
             return run_risk_report(database_path)
         return run_risk_replay(
@@ -414,7 +419,8 @@ def main() -> int:
                 for value in (args.symbol, args.risk_command_id, args.intent_id)
             ) or args.submit_demo or args.apply_demo_reconciliation or bridge_options:
                 parser.error("execution and bridge options do not apply to demo-run")
-            database_path = args.database_path or "data/traderrd.sqlite3"
+            load_dotenv(args.env_file)
+            database_path = _resolve_database_path(args.database_path)
             if args.no_tui:
                 return run_demo_runtime(
                     database_path, args.env_file, args.interval_seconds, use_tui=False
@@ -434,7 +440,7 @@ def main() -> int:
                 parser.error("execution and reconciliation options do not apply to demo-bridge")
             from traderrd.demo_bridge_cli import run_demo_bridge
 
-            database_path = args.database_path or "data/traderrd.sqlite3"
+            database_path = _resolve_database_path(args.database_path)
             return run_demo_bridge(
                 database_path,
                 args.message_id,
@@ -450,7 +456,7 @@ def main() -> int:
                 for value in (args.symbol, args.risk_command_id, args.intent_id)
             ) or args.submit_demo or args.apply_demo_reconciliation:
                 parser.error("execution options do not apply to demo-monitor")
-            database_path = args.database_path or "data/traderrd.sqlite3"
+            database_path = _resolve_database_path(args.database_path)
             return run_demo_monitor(
                 database_path,
                 args.apply_demo_monitor,
@@ -465,7 +471,7 @@ def main() -> int:
                 for value in (args.symbol, args.risk_command_id, args.intent_id)
             ) or args.submit_demo or args.apply_demo_reconciliation or args.apply_demo_monitor:
                 parser.error("execution and reconciliation options do not apply to demo-worker")
-            database_path = args.database_path or "data/traderrd.sqlite3"
+            database_path = _resolve_database_path(args.database_path)
             return run_demo_worker(
                 database_path,
                 args.apply_demo_worker,
@@ -480,7 +486,7 @@ def main() -> int:
             if args.submit_demo or args.apply_demo_reconciliation:
                 parser.error("demo-preflight is read-only")
             return run_demo_preflight(args.symbol, args.env_file)
-        database_path = args.database_path or "data/traderrd.sqlite3"
+        database_path = _resolve_database_path(args.database_path)
         if args.command == "demo-execute":
             if args.apply_demo_reconciliation or args.intent_id:
                 parser.error("reconciliation options require demo-reconcile")
@@ -504,12 +510,12 @@ def main() -> int:
     if args.command == "reprocess-audit":
         from traderrd.audit_reprocess import run_audit_reprocessing
 
-        database_path = args.database_path or "data/traderrd.sqlite3"
+        database_path = _resolve_database_path(args.database_path)
         return run_audit_reprocessing(database_path, limit=args.limit)
     if args.command == "simulate-history":
         from traderrd.historical_simulation_cli import run_historical_simulation
 
-        database_path = args.database_path or "data/traderrd.sqlite3"
+        database_path = _resolve_database_path(args.database_path)
         try:
             return run_historical_simulation(
                 database_path=database_path,
@@ -527,17 +533,17 @@ def main() -> int:
     if args.command == "tui":
         from traderrd.tui import run_tui
 
-        database_path = args.database_path or "data/traderrd.sqlite3"
+        database_path = _resolve_database_path(args.database_path)
         return run_tui(database_path)
 
     if args.command == "status":
         from traderrd.status_cli import run_status
 
-        database_path = args.database_path or "data/traderrd.sqlite3"
+        database_path = _resolve_database_path(args.database_path)
         return run_status(database_path, args.json, args.no_color)
     if args.command == "init-db":
         load_dotenv(args.env_file)
-        database_path = Path(os.getenv("TRADERRD_DB_PATH", "data/traderrd.sqlite3"))
+        database_path = Path(_resolve_database_path(args.database_path))
         SQLiteSignalRepository(database_path).initialize()
         print(f"Database initialized at {database_path}")
         return 0

@@ -128,12 +128,14 @@ def command_from_dict(payload: dict[str, Any]) -> RiskCommand:
         return ConfirmPendingFill(
             **common,
             reservation_id=_required_text(payload, "reservation_id"),
+            mark_equity=_decimal(payload, "mark_equity") if payload.get("mark_equity") is not None else None,
         )
     if command_type == "cancel_pending":
         return CancelPendingReservation(
             **common,
             reservation_id=_required_text(payload, "reservation_id"),
             reason=str(payload.get("reason", "operator_cancelled")),
+            mark_equity=_decimal(payload, "mark_equity") if payload.get("mark_equity") is not None else None,
         )
     if command_type == "confirm_close":
         return ConfirmPositionClosed(
@@ -181,7 +183,8 @@ def command_to_dict(command: RiskCommand) -> dict[str, Any]:
         )
     if isinstance(command, ConfirmPendingFill):
         return _simple_command(
-            command, "confirm_fill", reservation_id=command.reservation_id
+            command, "confirm_fill", reservation_id=command.reservation_id,
+            **({"mark_equity": canonical_decimal(command.mark_equity)} if command.mark_equity is not None else {}),
         )
     if isinstance(command, CancelPendingReservation):
         return _simple_command(
@@ -189,6 +192,7 @@ def command_to_dict(command: RiskCommand) -> dict[str, Any]:
             "cancel_pending",
             reservation_id=command.reservation_id,
             reason=command.reason,
+            **({"mark_equity": canonical_decimal(command.mark_equity)} if command.mark_equity is not None else {}),
         )
     if isinstance(command, ConfirmPositionClosed):
         return _simple_command(

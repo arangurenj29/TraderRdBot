@@ -5,7 +5,6 @@ loads credentials, opens Telegram/Bybit clients, or writes SQLite.
 """
 from __future__ import annotations
 
-from collections import deque
 from datetime import datetime
 import curses
 from dataclasses import dataclass
@@ -14,7 +13,7 @@ from pathlib import Path
 import os
 import sys
 import time
-from typing import Any, Callable, Deque
+from typing import Any, Callable
 
 from traderrd.application.status import TraderStatusReader
 
@@ -117,8 +116,6 @@ class TerminalDashboard:
         self._refresh_seconds = refresh_seconds
         self._clock = clock
         self._screen: Any | None = None
-        self._logs: Deque[str] = deque(maxlen=200)
-        self._show_logs = True
         self._last_refresh = 0.0
         self._payload: dict[str, Any] | None = None
         self._quit = False
@@ -174,7 +171,7 @@ class TerminalDashboard:
             self._screen = None
 
     def log(self, line: str) -> None:
-        self._logs.append(line)
+        pass
 
     def step(self, *, force: bool = False) -> bool:
         if self._screen is None:
@@ -188,8 +185,6 @@ class TerminalDashboard:
         key = self._screen.getch()
         if key in (ord("q"), ord("Q")):
             self._quit = True
-        elif key in (ord("l"), ord("L")):
-            self._show_logs = not self._show_logs
         elif key in (ord("r"), ord("R")):
             self._payload = self._reader.read()
             self._last_refresh = now
@@ -222,7 +217,7 @@ class TerminalDashboard:
         self._add(1, 1, f"{pulse} LIVE · refreshed {refreshed} · local SQLite read-only", curses.A_DIM | self._accent_attr())
         self._divider(2, width)
         if self._show_help:
-            self._add(3, 1, "HELP  q stop all Demo components · l toggle logs · r refresh · ? close help", self._accent_attr() | curses.A_BOLD)
+            self._add(3, 1, "HELP  q stop all Demo components · r refresh · ? close help", self._accent_attr() | curses.A_BOLD)
         components = payload.get("components", {})
         component_text = "  ".join(
             f"{name[:3].upper()} {str(components.get(name, {}).get('status', 'unknown')).upper()} {self._age(components.get(name, {}).get('age_seconds'))}"
@@ -267,9 +262,6 @@ class TerminalDashboard:
         projection_row = pair_header + 1 + len(pair_rows)
         projection_text = f"PROJECTION · HYPOTHETICAL planned TP/SL only: target {_money(projection.target_pnl)} · stop {_money(projection.stop_pnl)} · capacity {projection.available_slots if projection.available_slots is not None else '?'} slots"
         self._add(projection_row, 1, projection_text, curses.A_DIM | self._accent_attr())
-        logs_start = projection_row + 2
-        if self._show_logs and logs_start < footer_row:
-            self._logs_view(logs_start, footer_row, width)
         self._footer(height, width)
         screen.refresh()
 
@@ -329,15 +321,8 @@ class TerminalDashboard:
     def _divider(self, row: int, width: int) -> None:
         self._add(row, 1, "─" * max(1, width - 2), self._accent_attr() | curses.A_DIM)
 
-    def _logs_view(self, start: int, end: int, width: int) -> None:
-        self._add(start, 1, "LIVE LOGS", curses.A_BOLD)
-        lines = list(self._logs)[-(max(0, end - start - 1)):]
-        for offset, line in enumerate(lines, start=1):
-            self._add(start + offset, 2, line[: max(1, width - 4)])
-
     def _footer(self, height: int, width: int) -> None:
-        suffix = "logs on" if self._show_logs else "logs hidden"
-        self._add(height - 1, 1, f"q quit all components · l toggle logs · r refresh · ? help · {suffix}"[: max(1, width - 2)], curses.A_REVERSE)
+        self._add(height - 1, 1, "q quit all components · r refresh · ? help"[: max(1, width - 2)], curses.A_REVERSE)
 
     def _add(self, row: int, column: int, text: str, attr: int = 0) -> None:
         assert self._screen is not None

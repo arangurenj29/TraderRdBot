@@ -12,6 +12,7 @@ from traderrd.domain.models import Direction
 from traderrd.domain.risk import (
     ApplyEquitySnapshot,
     ConfirmPendingFill,
+    CancelPendingReservation,
     ConfirmPositionClosed,
     EngineMode,
     InitializeRiskEngine,
@@ -212,7 +213,7 @@ class PortfolioRiskEngineTests(unittest.TestCase):
         self.assertEqual(self.state.mode, EngineMode.ENTRY_PAUSED)
         self.assertEqual(
             self.state.reservations["pending"].status,
-            ReservationStatus.CANCELLED,
+            ReservationStatus.PENDING,
         )
         self.assertEqual(
             self.state.reservations["filled"].status,
@@ -248,7 +249,7 @@ class PortfolioRiskEngineTests(unittest.TestCase):
         self.assertEqual(self.state.mode, EngineMode.ACTIVE)
         self.assertFalse(self.state.weekly_halted)
 
-    def test_three_hour_expiry_releases_reservation_across_signal_gap(self) -> None:
+    def test_three_hour_expiry_retains_reservation_until_cancel_confirmation(self) -> None:
         self.propose("old", START + timedelta(minutes=1))
 
         transition = self.propose(
@@ -259,7 +260,7 @@ class PortfolioRiskEngineTests(unittest.TestCase):
 
         self.assertEqual(
             self.state.reservations["old"].status,
-            ReservationStatus.EXPIRED,
+            ReservationStatus.PENDING,
         )
         self.assertEqual(
             self.state.reservations["new"].status,
@@ -299,7 +300,7 @@ class PortfolioRiskEngineTests(unittest.TestCase):
             expires_at,
         )
 
-    def test_inverse_pending_is_cancelled_before_new_reservation(self) -> None:
+    def test_inverse_pending_is_staged_until_flat_cancel_confirmation(self) -> None:
         self.propose("long", START + timedelta(minutes=1))
 
         transition = self.propose(
@@ -308,21 +309,62 @@ class PortfolioRiskEngineTests(unittest.TestCase):
             direction=Direction.SHORT,
         )
 
-        self.assertEqual(
-            self.state.reservations["long"].status,
-            ReservationStatus.CANCELLED,
-        )
-        self.assertEqual(
-            self.state.reservations["short"].status,
-            ReservationStatus.PENDING,
-        )
-        self.assertEqual(
-            [action.action_type for action in transition.decision.actions],
-            [
-                RiskActionType.CANCEL_PENDING,
-                RiskActionType.CREATE_PENDING_POST_ONLY,
-            ],
-        )
+        self.assertEqual(self.state.reservations["long"].status, ReservationStatus.PENDING)
+        self.assertNotIn("short", self.state.reservations)
+        self.assertEqual(transition.decision.status, "staged")
+        self.assertEqual([a.action_type for a in transition.decision.actions], [RiskActionType.CANCEL_PENDING])
+        confirmed = self.engine.process(self.state, CancelPendingReservation(
+            "cancel", START + timedelta(minutes=3), "long"))
+        self.assertEqual(self.state.reservations["short"].status, ReservationStatus.PENDING)
+        self.assertEqual([a.action_type for a in confirmed.decision.actions], [RiskActionType.CREATE_PENDING_POST_ONLY])
+
+    def test_inverse_fill_race_retains_risk_and_requests_close(self) -> None:
+        self.propose("long", START + timedelta(minutes=1))
+        self.propose("short", START + timedelta(minutes=2), direction=Direction.SHORT)
+        result = self.engine.process(self.state, ConfirmPendingFill("fill", START + timedelta(minutes=3), "long"))
+        self.assertEqual(self.state.reservations["long"].status, ReservationStatus.CLOSE_REQUESTED)
+        self.assertGreater(self.state.total_reserved_risk, 0)
+        self.assertNotIn("short", self.state.reservations)
+        self.assertEqual([a.action_type for a in result.decision.actions], [RiskActionType.REQUEST_CLOSE_POSITION])
+
+    def test_pause_and_kill_keep_pending_risk_until_confirmed_cancel(self) -> None:
+        for equity in ("940", "850"):
+            with self.subTest(equity=equity):
+                self.setUp()
+                self.propose("pending", START + timedelta(minutes=1))
+                self.engine.process(self.state, ApplyEquitySnapshot("halt", START + timedelta(minutes=2), Decimal(equity)))
+                self.assertEqual(self.state.reservations["pending"].status, ReservationStatus.PENDING)
+                self.assertGreater(self.state.total_reserved_risk, 0)
+                self.engine.process(self.state, CancelPendingReservation("cancel", START + timedelta(minutes=3), "pending"))
+                self.assertEqual(self.state.total_reserved_risk, 0)
+
+    def test_kill_fill_race_requests_close_and_stays_reserved(self) -> None:
+        self.propose("pending", START + timedelta(minutes=1))
+        self.engine.process(self.state, ApplyEquitySnapshot("kill", START + timedelta(minutes=2), Decimal("850")))
+        result = self.engine.process(self.state, ConfirmPendingFill("fill", START + timedelta(minutes=3), "pending"))
+        self.assertEqual(self.state.reservations["pending"].status, ReservationStatus.CLOSE_REQUESTED)
+        self.assertEqual([a.action_type for a in result.decision.actions], [RiskActionType.REQUEST_CLOSE_POSITION])
+        self.assertGreater(self.state.total_reserved_risk, 0)
+
+    def test_repeated_inverse_cannot_replace_staged_signal_and_expiry_drops_it(self) -> None:
+        self.propose("long", START + timedelta(minutes=1))
+        self.propose("short", START + timedelta(minutes=2), direction=Direction.SHORT)
+        repeated = self.propose("short-new", START + timedelta(minutes=3), direction=Direction.SHORT)
+        self.assertEqual(repeated.decision.status, "rejected")
+        confirmed = self.engine.process(self.state, CancelPendingReservation(
+            "late-cancel", START + timedelta(hours=4), "long"))
+        self.assertEqual(confirmed.decision.status, "accepted")
+        self.assertNotIn("short", self.state.reservations)
+        self.assertNotIn("short-new", self.state.reservations)
+        self.assertEqual(self.state.total_reserved_risk, 0)
+
+    def test_pause_fill_race_keeps_protected_position_without_new_entry(self) -> None:
+        self.propose("pending", START + timedelta(minutes=1))
+        self.engine.process(self.state, ApplyEquitySnapshot("pause", START + timedelta(minutes=2), Decimal("940")))
+        result = self.engine.process(self.state, ConfirmPendingFill("fill", START + timedelta(minutes=3), "pending"))
+        self.assertEqual(self.state.reservations["pending"].status, ReservationStatus.FILLED)
+        self.assertEqual(result.decision.actions, ())
+        self.assertGreater(self.state.total_reserved_risk, 0)
 
     def test_filled_inverse_requires_close_confirmation_before_new_entry(self) -> None:
         self.propose("long", START + timedelta(minutes=1))
@@ -408,6 +450,8 @@ class PortfolioRiskEngineTests(unittest.TestCase):
                 Decimal("1100"),
             ),
         )
+        self.engine.process(self.state, CancelPendingReservation(
+            "pending-cancelled", START + timedelta(minutes=7), "pending"))
         rearmed = self.engine.process(
             self.state,
             ManualRearm(

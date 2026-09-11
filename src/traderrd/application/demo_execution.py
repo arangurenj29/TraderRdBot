@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
 from traderrd.application.risk_engine import decision_from_dict
 from traderrd.domain.execution import (
@@ -17,7 +18,7 @@ from traderrd.domain.execution import (
     InstrumentRules,
 )
 from traderrd.domain.models import Direction, canonical_decimal
-from traderrd.domain.risk import PortfolioState, RiskActionType, RiskDecision
+from traderrd.domain.risk import EngineMode, PortfolioState, ReservationStatus, RiskActionType, RiskDecision
 from traderrd.infrastructure.bybit_demo import (
     BybitV5DemoClient,
     DemoExecutionError,
@@ -125,10 +126,12 @@ class DemoExecutionService:
         client: BybitV5DemoClient,
         repository: SQLiteDemoExecutionRepository,
         rules: InstrumentRules,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._client = client
         self._repository = repository
         self._rules = rules
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def submit(self, intent: ExecutionIntent) -> ExecutionIntent:
         self._validate_namespace(intent.order_link_id)
@@ -136,10 +139,46 @@ class DemoExecutionService:
         if stored.state is not ExecutionIntentState.PLANNED:
             return stored
         if intent.kind is ExecutionIntentKind.ENTRY:
+            now = self._clock()
+            if now.tzinfo is None:
+                raise ValueError("Execution clock must be timezone-aware")
+            if self._repository.has_submission_attempt(intent.intent_id):
+                # An uncertain POST must never be repeated or assumed absent.
+                try:
+                    return self.reconcile(intent.intent_id)
+                except DemoExecutionError:
+                    self._unresolved(intent, "submission_outcome_unknown")
+                    raise
+            if intent.expires_at is None or intent.expires_at <= now:
+                return self._repository.transition(
+                    intent.intent_id, ExecutionIntentState.CANCELLED,
+                    "entry_expired_before_submission", "never_submitted_no_exposure",
+                )
+            risk = SQLiteRiskStateRepository(self._repository.database_path).load_state()
+            reservation = risk.reservations.get(intent.risk_reservation_id) if risk else None
+            if reservation is None or reservation.status is not ReservationStatus.PENDING:
+                self._unresolved(intent, "risk_submission_guard")
+                raise DemoExecutionError("risk_submission_guard", "Entry requires an active pending reservation; reconcile owned state first")
+            reversal = risk.reversal_intents.get(intent.symbol)
+            if risk.mode is not EngineMode.ACTIVE or (
+                reversal is not None and reversal.closing_reservation_id == intent.risk_reservation_id
+            ):
+                return self._repository.transition(
+                    intent.intent_id, ExecutionIntentState.CANCELLED,
+                    "entry_cancelled_before_submission", "risk_policy_blocks_unsent_entry",
+                )
+            self._repository.mark_submission_attempt(intent.intent_id)
             payload = self._entry_payload(intent)
             response = self._client.request("POST", "/v5/order/create", body=payload)
         elif intent.kind is ExecutionIntentKind.CANCEL_ENTRY:
             entry = self._owned_entry(intent.risk_reservation_id)
+            if entry.state in {ExecutionIntentState.PLANNED, ExecutionIntentState.CANCELLED} and not self._repository.has_submission_attempt(entry.intent_id):
+                self._repository.transition(entry.intent_id, ExecutionIntentState.CANCELLED,
+                    "entry_cancelled_before_submission", "never_submitted_no_exposure")
+                return self._repository.transition(intent.intent_id, ExecutionIntentState.CANCELLED,
+                    "cancel_confirmed", "never_submitted_owned_entry")
+            if entry.state is ExecutionIntentState.CANCELLED:
+                return self._retire_completed_cancel(intent, entry)
             response = self._client.request(
                 "POST",
                 "/v5/order/cancel",
@@ -158,10 +197,12 @@ class DemoExecutionService:
                 raise DemoExecutionError(
                     "close_guard", "Only an owned filled position can be closed"
                 )
+            if entry.state is ExecutionIntentState.FILLED and self._find_order(entry).get("orderStatus") not in {"Filled", "Cancelled", "Deactivated", "PartiallyFilledCanceled"}:
+                raise DemoExecutionError("close_guard", "Confirm entry remainder cancelled before closing owned exposure")
             response = self._client.request(
                 "POST",
                 "/v5/order/create",
-                body=self._close_payload(intent),
+                body=self._close_payload(replace(intent, quantity=entry.filled_quantity or intent.quantity)),
             )
         else:
             raise ValueError("Trading-stop intents are internal only")
@@ -201,29 +242,31 @@ class DemoExecutionService:
             return intent
         if intent.kind is ExecutionIntentKind.CANCEL_ENTRY:
             entry = self._owned_entry(intent.risk_reservation_id)
-            order = self._find_order(entry)
-            if order.get("orderStatus") not in {"Cancelled", "Deactivated"}:
+            if entry.state is ExecutionIntentState.CANCELLED:
+                return self._retire_completed_cancel(intent, entry)
+            reconciled = self.reconcile(entry.intent_id)
+            if reconciled.state in {ExecutionIntentState.FILLED, ExecutionIntentState.PROTECTION_VERIFIED}:
                 return self._repository.transition(
-                    intent.intent_id,
-                    ExecutionIntentState.RECONCILIATION_REQUIRED,
-                    "cancel_not_confirmed",
-                    "owned_order_still_active",
+                    intent.intent_id, ExecutionIntentState.FILLED,
+                    "cancel_raced_fill", "owned_entry_has_exposure",
                 )
-            self._repository.transition(
-                entry.intent_id,
-                ExecutionIntentState.CANCELLED,
-                "owned_entry_cancelled",
-                "cancel_reconciled",
-            )
+            if reconciled.state not in {ExecutionIntentState.CANCELLED, ExecutionIntentState.POSITION_CLOSED}:
+                return self._repository.transition(
+                    intent.intent_id, ExecutionIntentState.RECONCILIATION_REQUIRED,
+                    "cancel_not_confirmed", "owned_entry_not_confirmed_cancelled_flat",
+                )
             return self._repository.transition(
-                intent.intent_id,
-                ExecutionIntentState.CANCELLED,
-                "cancel_confirmed",
-                "owned_order_cancelled",
+                intent.intent_id, ExecutionIntentState.CANCELLED,
+                "cancel_confirmed", "owned_order_cancelled_flat",
             )
         order = self._find_order(intent)
         status = order.get("orderStatus")
-        if status in {"New", "PartiallyFilled", "Untriggered"}:
+        if intent.kind is ExecutionIntentKind.ENTRY and status in {
+            "PartiallyFilled", "Filled", "Cancelled", "Deactivated", "Rejected",
+            "PartiallyFilledCanceled",
+        }:
+            return self._reconcile_entry_order(intent, order)
+        if status in {"New", "Untriggered"}:
             return self._repository.transition(
                 intent.intent_id,
                 ExecutionIntentState.WORKING,
@@ -287,25 +330,112 @@ class DemoExecutionService:
                 "close_confirmed",
                 "order_execution_and_flat_position",
             )
-        if size <= 0 or not _position_side_matches(position, intent.direction):
+        return self._unresolved(intent, "unexpected_filled_intent_kind")
+
+    def _reconcile_entry_order(self, intent: ExecutionIntent, order: dict[str, Any]) -> ExecutionIntent:
+        status = order.get("orderStatus")
+        quantity = _safe_decimal(order.get("cumExecQty"))
+        position = self._position(intent.symbol)
+        size = _safe_decimal(position.get("size"))
+        if quantity == 0 and status in {"Cancelled", "Deactivated", "Rejected"}:
+            if size != 0 or intent.filled_quantity is not None:
+                return self._unresolved(intent, "cancel_position_mismatch")
             return self._repository.transition(
                 intent.intent_id,
-                ExecutionIntentState.RECONCILIATION_REQUIRED,
-                "fill_position_mismatch",
-                "position_confirmation_missing",
+                ExecutionIntentState.REJECTED if status == "Rejected" else ExecutionIntentState.CANCELLED,
+                "entry_terminal_flat", "zero_execution_and_flat_position",
             )
+        evidence = self._client.request("GET", "/v5/execution/list", {
+            "category": "linear", "symbol": intent.symbol, "orderLinkId": intent.order_link_id,
+        })
+        rows = _result_rows(evidence)
+        if evidence["result"].get("nextPageCursor") or not rows:
+            return self._unresolved(intent, "incomplete_execution_evidence")
+        identifiers = [row.get("execId") for row in rows]
+        if (any(not isinstance(value, str) or not value for value in identifiers)
+            or len(set(identifiers)) != len(identifiers)
+            or any(row.get("orderLinkId", intent.order_link_id) != intent.order_link_id for row in rows)
+            or sum((_safe_decimal(row.get("execQty")) for row in rows), Decimal("0")) != quantity):
+            return self._unresolved(intent, "execution_quantity_mismatch")
+        if not 0 < quantity <= intent.quantity or (intent.filled_quantity is not None and quantity < intent.filled_quantity):
+            return self._unresolved(intent, "execution_quantity_mismatch")
+        if (size == 0 and intent.filled_quantity == quantity
+            and status in {"Filled", "Cancelled", "Deactivated", "PartiallyFilledCanceled"}):
+            return self._repository.transition(
+                intent.intent_id, ExecutionIntentState.POSITION_CLOSED_PENDING,
+                "position_closed_detected", "owned_position_flat; exit_reason_unknown",
+            )
+        if size != quantity or not _position_side_matches(position, intent.direction):
+            return self._unresolved(intent, "fill_position_mismatch")
+        self._repository.record_fill_quantity(intent.intent_id, quantity)
         filled = self._repository.transition(
-            intent.intent_id,
-            ExecutionIntentState.FILLED,
-            "fill_confirmed",
-            "order_execution_and_position_confirmed",
+            intent.intent_id, ExecutionIntentState.FILLED, "fill_confirmed",
+            "cumulative_execution_and_position_confirmed",
         )
         self._set_and_verify_protection(filled)
+        if status == "PartiallyFilled":
+            self._client.request("POST", "/v5/order/cancel", body={
+                "category": "linear", "symbol": intent.symbol, "orderLinkId": intent.order_link_id,
+            })
+            final = self._find_order(intent)
+            if final.get("orderStatus") not in {"Filled", "Cancelled", "Deactivated", "PartiallyFilledCanceled"}:
+                return self._unresolved(filled, "partial_remainder_not_cancelled")
+            # Re-read cumulative fills and position after cancellation: another
+            # fill may have raced with the cancellation request.
+            return self._reconcile_entry_order(filled, final)
         return self._repository.transition(
-            intent.intent_id,
-            ExecutionIntentState.PROTECTION_VERIFIED,
-            "protection_verified",
-            "exchange_side_tp_sl",
+            intent.intent_id, ExecutionIntentState.PROTECTION_VERIFIED,
+            "protection_verified", "exchange_side_tp_sl_no_live_remainder",
+        )
+
+    def _retire_completed_cancel(
+        self, intent: ExecutionIntent, entry: ExecutionIntent
+    ) -> ExecutionIntent:
+        """Retire a redundant request, never repost or resurrect its parent.
+
+        Old confirmation decisions could emit a second cancellation action.
+        Durable cancellation plus current flat/open-order evidence is sufficient
+        even after the historical order disappears from exchange history.
+        """
+        def refuse(reason: str) -> None:
+            self._unresolved(intent, reason)
+            raise DemoExecutionError(
+                "cancel_reconciliation", "Completed cancellation conflicts with current exchange evidence; reconcile before new entries"
+            )
+
+        position = self._position(entry.symbol)
+        if _safe_decimal(position.get("size")) != 0:
+            refuse("completed_cancel_position_not_flat")
+        response = self._client.request("GET", "/v5/order/realtime", {
+            "category": "linear", "symbol": entry.symbol,
+            "orderLinkId": entry.order_link_id, "openOnly": "0",
+        })
+        rows = _result_rows(response)
+        if response["result"].get("nextPageCursor") or any(
+            row.get("orderLinkId") != entry.order_link_id
+            or row.get("orderStatus") not in {"Cancelled", "Deactivated"}
+            or _safe_decimal(row.get("cumExecQty")) != 0
+            for row in rows
+        ):
+            refuse("completed_cancel_order_not_terminal")
+        if entry.filled_quantity is not None:
+            refuse("completed_cancel_has_fill_evidence")
+        retired = self._repository.transition(
+            intent.intent_id, ExecutionIntentState.CANCELLED,
+            "redundant_cancel_retired", "parent_cancelled_current_flat_no_live_order",
+        )
+        risk = SQLiteRiskStateRepository(self._repository.database_path).load_state()
+        reservation = risk.reservations.get(entry.risk_reservation_id) if risk else None
+        if reservation is not None and reservation.status in {
+            ReservationStatus.CANCELLED, ReservationStatus.EXPIRED, ReservationStatus.CLOSED,
+        }:
+            self._repository.mark_risk_sync_completed(intent.intent_id)
+        return retired
+
+    def _unresolved(self, intent: ExecutionIntent, reason: str) -> ExecutionIntent:
+        return self._repository.transition(
+            intent.intent_id, ExecutionIntentState.RECONCILIATION_REQUIRED,
+            reason, "manual_demo_reconciliation_required",
         )
 
     def attribute_closed_outcome(
@@ -423,6 +553,11 @@ class DemoExecutionService:
                 "position_reopened",
                 "position_size_nonzero_after_flat_confirmation",
             )
+        expected_quantity = intent.filled_quantity or intent.quantity
+        if (size != expected_quantity
+            or _safe_decimal(position.get("takeProfit", "0")) != self._rules.normalize_entry_price(intent.take_profit, intent.direction)
+            or _safe_decimal(position.get("stopLoss", "0")) != self._rules.normalize_entry_price(intent.stop_loss, intent.direction)):
+            return self._unresolved(intent, "protected_position_or_tp_sl_mismatch")
         return intent
 
     def cancel_expired(self, now: datetime) -> int:
@@ -430,6 +565,8 @@ class DemoExecutionService:
             raise ValueError("Expiry timestamp must be timezone-aware")
         cancelled = 0
         for entry in self._repository.expirable_entries(now):
+            if entry.symbol != self._rules.symbol:
+                continue
             self._validate_namespace(entry.order_link_id)
             self._client.request(
                 "POST",
@@ -440,22 +577,8 @@ class DemoExecutionService:
                     "orderLinkId": entry.order_link_id,
                 },
             )
-            order = self._find_order(entry)
-            if order.get("orderStatus") in {"Cancelled", "Deactivated"}:
-                self._repository.transition(
-                    entry.intent_id,
-                    ExecutionIntentState.CANCELLED,
-                    "entry_expired_cancelled",
-                    "three_hour_expiry_no_market_fallback",
-                )
-                cancelled += 1
-            else:
-                self._repository.transition(
-                    entry.intent_id,
-                    ExecutionIntentState.RECONCILIATION_REQUIRED,
-                    "expiry_cancel_not_confirmed",
-                    "manual_demo_reconciliation_required",
-                )
+            reconciled = self.reconcile(entry.intent_id)
+            cancelled += int(reconciled.state is ExecutionIntentState.CANCELLED)
         return cancelled
 
     def _find_order(self, intent: ExecutionIntent) -> dict[str, Any]:
@@ -517,7 +640,9 @@ class DemoExecutionService:
         )
         position = self._position(intent.symbol)
         if (
-            _safe_decimal(position.get("takeProfit", "0")) != take_profit
+            _safe_decimal(position.get("size")) != (intent.filled_quantity or intent.quantity)
+            or not _position_side_matches(position, intent.direction)
+            or _safe_decimal(position.get("takeProfit", "0")) != take_profit
             or _safe_decimal(position.get("stopLoss", "0")) != stop_loss
         ):
             raise DemoExecutionError(
@@ -647,7 +772,7 @@ def _unique_closed_pnl_match(
         except DemoExecutionError:
             incomplete = True
             continue
-        if closed_size != entry.quantity:
+        if closed_size != (entry.filled_quantity or entry.quantity):
             continue
         try:
             order_id = _nonempty_text(row.get("orderId"))

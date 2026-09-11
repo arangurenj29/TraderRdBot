@@ -21,6 +21,19 @@ and exchange reconciliation independently visible and restartable.
 - A pending entry expires after three hours and is cancelled without a market
   fallback. An inverse pending signal cancels first; an inverse filled position
   closes reduce-only and must be confirmed flat before the opposite entry.
+- Expiry, inverse, pause, and kill cancellation requests never release risk.
+  Reuse the existing staged reversal until confirmed flat cancellation or close;
+  a cancellation-racing inverse/kill fill requires an owned reduce-only close.
+  A pause-racing fill keeps its protective exits. Never replay an unsent entry
+  against an inactive reservation or halted ledger.
+- Expiry requests cancellation without releasing risk. Release an expired entry
+  only after confirmed zero executions and flatness; never repost an uncertain
+  submission. Protect partial exposure, cancel its remainder, and reconcile any
+  cumulative fill increase before reporting protection verified. Preserve planned
+  quantity separately from durable confirmed filled quantity.
+- Recheck position quantity, side, TP, and SL every protected-position cycle.
+  Recovery after a risk commit reuses the original persisted command input and
+  completes local effects without weakening payload idempotency.
 - Exchange acknowledgement is not a fill. Fill, position, and exchange-side
   TP/SL evidence must be reconciled before risk state advances.
 - Protected entries remain monitorable after TP/SL verification. A verified
@@ -61,8 +74,8 @@ For normal Demo-only operation, use the one visible supervised command:
 
 It starts observer, worker, and monitor in one terminal. In an interactive TTY
 it opens a read-only full-screen dashboard with dominant health/risk, signal
-flow, orders, per-pair performance, hypothetical TP/SL scenarios, and collapsible
-child logs. Use curses color pairs only with graceful monochrome fallback; never
+flow, orders, per-pair performance, and hypothetical TP/SL scenarios. Use curses
+color pairs only with graceful monochrome fallback; never
 write raw ANSI sequences from the TUI. `q` or
 `Ctrl-C` stops all children cleanly; `--no-tui` retains prefixed logs. The TUI
 reads SQLite only and must never make exchange/Telegram calls or write state.

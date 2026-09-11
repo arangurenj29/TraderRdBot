@@ -18,4 +18,4 @@ RUN pip install --no-cache-dir . \
 USER traderrd
 VOLUME ["/var/lib/traderrd"]
 ENTRYPOINT ["traderrd"]
-CMD ["demo-run", "--no-tui"]
+CMD ["demo-run", "--no-tui", "--database-path", "/var/lib/traderrd/traderrd.sqlite3"]

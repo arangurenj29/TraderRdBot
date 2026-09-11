@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+import os
 import signal
 import subprocess
 import tempfile
@@ -176,6 +177,18 @@ class DemoRuntimeTests(unittest.TestCase):
         ):
             self.assertEqual(main(), 0)
         run.assert_called_once_with("runtime.sqlite3", "demo.env", 12.0)
+
+    def test_demo_run_resolves_dotenv_database_before_starting_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "runtime.env"
+            env_file.write_text("TRADERRD_DB_PATH=custom.sqlite3\n")
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("sys.argv", ["traderrd", "demo-run", "--env-file", str(env_file)]),
+                patch("traderrd.demo_cli.run_demo_runtime", return_value=0) as run,
+            ):
+                self.assertEqual(main(), 0)
+                self.assertEqual(run.call_args.args[0], "custom.sqlite3")
 
     def test_cli_rejects_mutation_flags_on_demo_run(self) -> None:
         with (

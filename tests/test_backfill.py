@@ -214,6 +214,7 @@ class TelegramBackfillTests(unittest.TestCase):
         with self.assertRaises(BackfillAuthorizationError) as raised:
             self.run_history(client)
         self.assertIn("not authorized", str(raised.exception))
+        self.assertIn("traderrd telegram-auth", str(raised.exception))
         self.assertTrue(client.disconnected)
         self.assertIsNone(client.iteration_arguments)
 

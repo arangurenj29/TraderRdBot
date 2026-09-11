@@ -52,6 +52,13 @@ class ServerDeploymentTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
+    def test_healthcheck_timeout_allows_swap_limited_startup_without_relaxing_checks(self) -> None:
+        compose = Path("compose.yaml").read_text()
+        self.assertIn("timeout: 20s", compose)
+        self.assertIn("interval: 30s", compose)
+        self.assertIn("retries: 3", compose)
+        self.assertIn("start_period: 2m", compose)
+
     def test_healthcheck_is_strict_and_read_only(self) -> None:
         self.assertEqual(run_healthcheck(self.database), 1)
         self.assertFalse(self.database.exists())

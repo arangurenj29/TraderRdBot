@@ -102,7 +102,7 @@ async def backfill_history(
 
     if client_factory is None and not _session_file(config.session_path).exists():
         raise BackfillAuthorizationError(
-            "Authorized Telegram session file was not found. Run 'traderrd run' "
+            "Authorized Telegram session file was not found. Run 'traderrd telegram-auth' "
             "interactively once before backfill."
         )
     client = factory(
@@ -118,7 +118,7 @@ async def backfill_history(
             await client.connect()
             if not await client.is_user_authorized():
                 raise BackfillAuthorizationError(
-                    "Telegram session is not authorized. Run 'traderrd run' "
+                    "Telegram session is not authorized. Run 'traderrd telegram-auth' "
                     "interactively once before backfill."
                 )
             try:

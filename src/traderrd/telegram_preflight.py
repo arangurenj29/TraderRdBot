@@ -56,7 +56,7 @@ async def inspect_configured_source(
             ) from exc
         if not _session_file(config.session_path).exists():
             raise SourcePreflightError(
-                "Authorized Telegram session file was not found. Run 'traderrd run' "
+                "Authorized Telegram session file was not found. Run 'traderrd telegram-auth' "
                 "interactively once before source inspection."
             )
         factory = TelegramClient
@@ -68,7 +68,7 @@ async def inspect_configured_source(
         await client.connect()
         if not await client.is_user_authorized():
             raise SourcePreflightError(
-                "Telegram session is not authorized. Run 'traderrd run' "
+                "Telegram session is not authorized. Run 'traderrd telegram-auth' "
                 "interactively once before source inspection."
             )
         try:

@@ -103,6 +103,7 @@ class ExecutionIntent:
     stop_loss: Decimal | None
     expires_at: datetime | None
     exchange_order_id: str | None = None
+    filled_quantity: Decimal | None = None
 
 
 def _floor_increment(value: Decimal, increment: Decimal) -> Decimal:

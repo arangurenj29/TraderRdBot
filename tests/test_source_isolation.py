@@ -225,13 +225,14 @@ class TelegramSourceIsolationTests(unittest.TestCase):
             FakeMessage(231906, LONG_SIGNAL), authorized=False
         )
 
-        with self.assertRaises(SourcePreflightError):
+        with self.assertRaises(SourcePreflightError) as raised:
             asyncio.run(
                 inspect_configured_source(
                     self.config, client_factory=lambda *args, **kwargs: client
                 )
             )
 
+        self.assertIn("traderrd telegram-auth", str(raised.exception))
         self.assertTrue(client.disconnected)
 
     def test_preflight_applies_expected_sender_as_second_guard(self) -> None:

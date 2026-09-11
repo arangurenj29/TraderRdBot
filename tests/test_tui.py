@@ -92,11 +92,13 @@ class TuiRenderTests(unittest.TestCase):
         dashboard = TerminalDashboard("missing.sqlite3")
         dashboard._screen = screen
         dashboard._reader = type("Reader", (), {"read": lambda _: self._payload()})()
+        dashboard.log("[worker] test log line")
         self.assertTrue(dashboard.step(force=True))
         self.assertTrue(screen.refreshed)
         self.assertTrue(any("HEALTH / RISK" in line for line in screen.rendered))
         self.assertTrue(any("BY PAIR" in line for line in screen.rendered))
         self.assertTrue(any("DEMO ONLY" in line for line in screen.rendered))
+        self.assertFalse(any("LIVE LOGS" in line for line in screen.rendered))
 
     def test_question_mark_toggles_help_and_small_screen_renders_safely(self) -> None:
         screen = self._Screen(key=ord("?"), height=18, width=76)
@@ -106,6 +108,7 @@ class TuiRenderTests(unittest.TestCase):
         self.assertTrue(dashboard.step(force=True))
         self.assertTrue(dashboard._show_help)
         self.assertTrue(any("HELP" in line for line in screen.rendered))
+        self.assertFalse(any("LIVE LOGS" in line for line in screen.rendered))
 
 
 class TuiColorTests(unittest.TestCase):
