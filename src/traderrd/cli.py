@@ -186,6 +186,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stored execution intent to reconcile (demo-reconcile only)",
     )
     parser.add_argument(
+        "--close-owned-position", action="store_true",
+        help="Explicitly request immediate reduce-only closure of an owned entry (demo-reconcile only)",
+    )
+    parser.add_argument(
         "--apply-demo-reconciliation",
         action="store_true",
         help="Permit private reconciliation and TP/SL setup on Demo Trading",
@@ -248,6 +252,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.close_owned_position and (args.command != "demo-reconcile" or not args.apply_demo_reconciliation):
+        parser.error("--close-owned-position requires demo-reconcile --apply-demo-reconciliation")
     retired_testnet_commands = {
         "testnet-preflight",
         "testnet-execute",
@@ -501,6 +507,9 @@ def main() -> int:
             parser.error("demo-reconcile requires --intent-id")
         if args.submit_demo or args.risk_command_id or args.symbol:
             parser.error("execution options require demo-execute")
+        if args.close_owned_position:
+            return run_demo_reconcile(database_path, args.intent_id, True, args.env_file,
+                                      close_owned_position=True)
         return run_demo_reconcile(
             database_path,
             args.intent_id,

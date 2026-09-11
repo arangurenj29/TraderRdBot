@@ -727,6 +727,30 @@ Telegram message
   recovery reuses its original timestamp/equity input and finishes pending
   local effects without relaxing command-payload idempotency.
 
+### Explicit owned-position close recovery
+
+Stop the supervised Demo runtime before this operator-only recovery so the
+worker/monitor cannot concurrently apply strategy actions. For an existing owned
+entry intent, use:
+
+```bash
+traderrd demo-reconcile --database-path data/traderrd.sqlite3 --intent-id ENTRY_INTENT_ID --apply-demo-reconciliation --close-owned-position
+```
+
+This proves complete paginated executions and the exact one-way position, records
+the fill and an idempotent operator close request, and uses the existing owned
+reduce-only close link. It does not install potentially stale TP/SL before closing.
+A live entry remainder, missing/ambiguous evidence, or a non-Demo endpoint refuses
+closure. Execution pagination is bounded to ten pages of 100 rows; repeated cursors,
+missing pages, duplicate execution IDs, and quantity mismatches fail closed.
+
+Success requires confirmed flatness, attributed closed-PnL, and the normal risk
+close record (`risk_released=true`). If the command returns pending/unreleased,
+repeat the same invocation to reconcile the existing intent, never create a manual
+exchange order or edit SQLite. An uncertain submission is never blindly reposted.
+The explicit operator request also clears a staged inverse entry. Keep all audit
+history and resume normal supervision only after closure is fully reconciled.
+
 ### One visible Demo runtime terminal
 
 For normal Demo operation, use one foreground command:
@@ -1135,3 +1159,10 @@ service, healthcheck, and `.env.server.example` remain Demo-only. A future
 real-account deployment requires a separate design, configuration surface,
 review, and explicit human approval; changing an endpoint or reusing this
 Compose service is not an allowed migration path.
+
+The explicit applied owned-close command acquires the same operation lock as
+`demo-run` before loading credentials and holds it until reconciliation returns.
+Stop individually launched worker/monitor processes too: they do not own this
+supervisor lock. Close confirmation requires unique execution IDs, exact owned
+order/link, symbol, closing side and full cumulative filled quantity; flatness
+alone cannot release risk.

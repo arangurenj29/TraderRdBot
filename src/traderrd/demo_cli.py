@@ -18,7 +18,7 @@ from traderrd.application.demo_worker import (
     DemoSignalWorker,
     DemoWorkerError,
 )
-from traderrd.demo_runtime import run_demo_runtime
+from traderrd.demo_runtime import run_demo_runtime, _exclusive_runtime_lock, _LOCK_NAME, DemoRuntimeAlreadyRunningError
 from traderrd.config import load_dotenv
 from traderrd.domain.execution import ExecutionIntentKind, ExecutionIntentState
 from traderrd.infrastructure.bybit_demo import (
@@ -136,6 +136,28 @@ def run_demo_reconcile(
     intent_id: str,
     apply_reconciliation: bool,
     env_path: str | Path = ".env",
+    *,
+    close_owned_position: bool = False,
+) -> int:
+    if close_owned_position and apply_reconciliation:
+        try:
+            with _exclusive_runtime_lock(Path(database_path).resolve().parent / _LOCK_NAME):
+                return _run_demo_reconcile(database_path, intent_id, apply_reconciliation,
+                                           env_path, close_owned_position=True)
+        except (DemoRuntimeAlreadyRunningError, OSError) as exc:
+            print(f"Bybit Demo Trading reconciliation failed: {exc}")
+            return 1
+    return _run_demo_reconcile(database_path, intent_id, apply_reconciliation, env_path,
+                               close_owned_position=close_owned_position)
+
+
+def _run_demo_reconcile(
+    database_path: str | Path,
+    intent_id: str,
+    apply_reconciliation: bool,
+    env_path: str | Path = ".env",
+    *,
+    close_owned_position: bool = False,
 ) -> int:
     try:
         repository = SQLiteDemoExecutionRepository(database_path)
@@ -152,14 +174,26 @@ def run_demo_reconcile(
         client = load_demo_client(env_path)
         report = BybitDemoPreflight(client).run(intent.symbol)
         service = DemoExecutionService(client, repository, report.instrument)
-        reconciled = service.reconcile(intent.intent_id)
+        if close_owned_position:
+            repository.initialize()
+            risk = SQLiteRiskStateRepository(database_path)
+            risk.initialize()
+            reconciled = DemoLifecycleMonitor(repository, risk, client,
+                BybitDemoAccountSnapshotProvider(client)).close_owned_position(intent.intent_id)
+            state = risk.load_state()
+            released = state is not None and state.reservations[intent.risk_reservation_id].status.value == "closed"
+            print("Bybit Demo owned operator close: "
+                  f"state={reconciled.state.value} risk_released={str(released).lower()} mainnet_enabled=false")
+            return 0 if released else 1
+        else:
+            reconciled = service.reconcile(intent.intent_id)
         print(
             "Bybit Demo Trading reconciliation complete: "
             f"state={reconciled.state.value} "
             "acknowledgement_is_fill=false mainnet_enabled=false"
         )
         return 0
-    except (ValueError, sqlite3.Error, DemoExecutionError) as exc:
+    except (ValueError, sqlite3.Error, DemoExecutionError, DemoMonitorError) as exc:
         print(f"Bybit Demo Trading reconciliation failed: {exc}")
         return 1
 

@@ -109,6 +109,16 @@ Stop the worker before the monitor and the
 observer; do not stop the monitor while owned positions or orders remain
 unreconciled.
 
+## Explicit owned close recovery
+
+With the supervised Demo runtime stopped, an operator may use `demo-reconcile
+--intent-id ENTRY_INTENT_ID --apply-demo-reconciliation --close-owned-position`.
+This proves bounded complete entry executions and the exact owned position before
+requesting its idempotent reduce-only close, without installing stale TP/SL first.
+It clears staged inverse intent and preserves normal closed-PnL/risk-close history.
+Pending/uncertain results must retry the same entry ID; never use manual exchange
+orders or SQLite edits. Resume supervision only after `risk_released=true`.
+
 ## Testing
 
 From the repository root:
@@ -160,3 +170,10 @@ order, cursor, risk, source-isolation, and restart/idempotency change.
   directly or restore without clearing stale WAL/SHM sidecars.
 - Server prerequisites must link to Docker's official Ubuntu Engine and Compose
   installation documentation; never add Docker installation scripts to this repo.
+
+The explicit applied owned-close command acquires the same operation lock as
+`demo-run` before loading credentials and holds it until reconciliation returns.
+Stop individually launched worker/monitor processes too: they do not own this
+supervisor lock. Close confirmation requires unique execution IDs, exact owned
+order/link, symbol, closing side and full cumulative filled quantity; flatness
+alone cannot release risk.

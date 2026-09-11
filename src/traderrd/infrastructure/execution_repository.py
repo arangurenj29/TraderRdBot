@@ -296,6 +296,16 @@ class SQLiteDemoExecutionRepository:
             ).fetchone()
             return self._from_row(row) if row else None
 
+    def find_close(self, reservation_id: str) -> ExecutionIntent | None:
+        with self._connection(readonly=True) as connection:
+            rows = connection.execute(
+                "SELECT * FROM demo_execution_intents WHERE risk_reservation_id=? AND kind='close_position'",
+                (reservation_id,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("Owned close intent is ambiguous")
+        return self._from_row(rows[0]) if rows else None
+
     def expirable_entries(self, now: datetime) -> list[ExecutionIntent]:
         with self._connection(readonly=True) as connection:
             rows = connection.execute(
@@ -333,8 +343,13 @@ class SQLiteDemoExecutionRepository:
     def mark_risk_sync_completed(self, intent_id: str) -> None:
         """Complete the durable terminal handoff only after all risk effects."""
         with self._connection() as connection:
-            self._event(connection, intent_id, "risk_sync_completed", "risk_effects_persisted",
-                        datetime.now(timezone.utc).isoformat())
+            connection.execute(
+                """INSERT INTO demo_execution_events(intent_id, event_type, detail, occurred_at)
+                SELECT ?, 'risk_sync_completed', 'risk_effects_persisted', ?
+                WHERE NOT EXISTS (SELECT 1 FROM demo_execution_events
+                    WHERE intent_id=? AND event_type='risk_sync_completed')""",
+                (intent_id, datetime.now(timezone.utc).isoformat(), intent_id),
+            )
 
     def planned_intents(self) -> list[ExecutionIntent]:
         """Return durable plans awaiting their first exchange submission."""

@@ -352,8 +352,6 @@ class DemoSignalWorker:
             else:
                 if recovered.state is not ExecutionIntentState.PLANNED:
                     return 0, 0
-        if intent.kind is ExecutionIntentKind.CLOSE_POSITION:
-            self._execution.mark_submission_attempt(intent.intent_id)
         before = current.state
         stored = service.submit(current)
         return int(before is ExecutionIntentState.PLANNED and stored.state is ExecutionIntentState.ACKNOWLEDGED), 0
