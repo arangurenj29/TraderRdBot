@@ -419,6 +419,7 @@ def main() -> int:
                 for value in (args.symbol, args.risk_command_id, args.intent_id)
             ) or args.submit_demo or args.apply_demo_reconciliation or bridge_options:
                 parser.error("execution and bridge options do not apply to demo-run")
+            load_dotenv(args.env_file)
             database_path = _resolve_database_path(args.database_path)
             if args.no_tui:
                 return run_demo_runtime(

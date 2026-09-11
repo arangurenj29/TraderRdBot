@@ -683,15 +683,35 @@ Telegram message
 
 - **Entry expiry:** the entry window is Telegram receipt time plus three hours.
   An unfilled PostOnly entry is cancelled; the system never replaces it with a
-  market entry.
+  market entry. Expiry alone does not release reserved risk: cancellation must
+  prove zero executed quantity and a flat position. Never-submitted expired
+  plans are cancelled locally; uncertain prior submissions are reconciled,
+  never blindly reposted.
+- **Partial fills:** execution quantities must match the owned position. The
+  monitor protects the executed quantity, cancels the remainder, then rechecks
+  fills for cancellation races. Planned quantity stays immutable; confirmed
+  filled quantity is persisted separately for protection and closed-PnL checks.
+  Incomplete or paginated execution evidence remains unresolved and reserved.
 - **Pending inverse:** an opposite signal cancels the owned pending order first.
-  The new entry is submitted only after cancellation is confirmed.
+  The opposite proposal stays staged without releasing the existing reservation;
+  it is admitted once only after zero executions and flat cancellation are
+  confirmed. If the order fills during cancellation, the owned position is
+  protected and closed before considering the opposite entry. An expired or
+  newly inadmissible opposite proposal is discarded without blocking the
+  successful cancellation/close handoff.
+- **Pause and kill cancellation:** cancellation requests retain reserved risk.
+  A fill racing a pause keeps its hard TP/SL; a fill racing the kill switch is
+  protected and requests a reduce-only close. Unsent plans cannot bypass a
+  paused/killed ledger on restart. Legacy inactive-risk/owned-exposure conflicts
+  refuse new entries and require reconciliation, never automatic database repair.
 - **Filled inverse:** an opposite signal requests an owned reduce-only market
   close. The opposite PostOnly reservation is staged only after execution
   evidence and a flat one-way position are confirmed.
 - **Protection:** after a fill is proven, the monitor sets and verifies the
   signal TP and SL on the exchange. Missing, contradictory, or incomplete
-  evidence becomes `reconciliation_required`, never an invented fill.
+  evidence becomes `reconciliation_required`, never an invented fill. Every
+  later cycle rechecks position size, side, TP, and SL; removed or mismatched
+  protection cannot remain reported as verified.
 - **Protected-position closure:** a protected entry stays monitorable after
   TP/SL verification. The monitor re-reads its owned one-way position each
   cycle; an observed flat position first enters durable
@@ -703,7 +723,9 @@ Telegram message
   excluded from performance. The local record intentionally stores
   `exit_reason_unknown` unless concrete exchange evidence identifies TP or SL.
   A reopened, mismatched, or ambiguous position fails closed and remains
-  available for reconciliation.
+  available for reconciliation. If interrupted after the risk command commits,
+  recovery reuses its original timestamp/equity input and finishes pending
+  local effects without relaxing command-payload idempotency.
 
 ### One visible Demo runtime terminal
 

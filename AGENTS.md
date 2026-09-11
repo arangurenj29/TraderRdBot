@@ -21,6 +21,19 @@ and exchange reconciliation independently visible and restartable.
 - A pending entry expires after three hours and is cancelled without a market
   fallback. An inverse pending signal cancels first; an inverse filled position
   closes reduce-only and must be confirmed flat before the opposite entry.
+- Expiry, inverse, pause, and kill cancellation requests never release risk.
+  Reuse the existing staged reversal until confirmed flat cancellation or close;
+  a cancellation-racing inverse/kill fill requires an owned reduce-only close.
+  A pause-racing fill keeps its protective exits. Never replay an unsent entry
+  against an inactive reservation or halted ledger.
+- Expiry requests cancellation without releasing risk. Release an expired entry
+  only after confirmed zero executions and flatness; never repost an uncertain
+  submission. Protect partial exposure, cancel its remainder, and reconcile any
+  cumulative fill increase before reporting protection verified. Preserve planned
+  quantity separately from durable confirmed filled quantity.
+- Recheck position quantity, side, TP, and SL every protected-position cycle.
+  Recovery after a risk commit reuses the original persisted command input and
+  completes local effects without weakening payload idempotency.
 - Exchange acknowledgement is not a fill. Fill, position, and exchange-side
   TP/SL evidence must be reconciled before risk state advances.
 - Protected entries remain monitorable after TP/SL verification. A verified
