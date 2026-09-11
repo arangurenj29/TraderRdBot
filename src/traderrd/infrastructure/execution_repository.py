@@ -90,6 +90,27 @@ class SQLiteDemoExecutionRepository:
                 """
             )
 
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(demo_execution_intents)")}
+            if "filled_quantity" not in columns:
+                connection.execute("ALTER TABLE demo_execution_intents ADD COLUMN filled_quantity TEXT")
+
+    def record_fill_quantity(self, intent_id: str, quantity: Decimal) -> ExecutionIntent:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._get(connection, intent_id)
+            if current is None or not quantity.is_finite() or not 0 < quantity <= current.quantity:
+                raise ValueError("Invalid owned execution quantity")
+            if current.filled_quantity is not None and quantity < current.filled_quantity:
+                raise ValueError("Cumulative execution quantity cannot decrease")
+            connection.execute(
+                "UPDATE demo_execution_intents SET filled_quantity = ? WHERE intent_id = ?",
+                (canonical_decimal(quantity), intent_id),
+            )
+            updated = self._get(connection, intent_id)
+            if updated is None:
+                raise RuntimeError("Execution intent disappeared during fill persistence")
+            return updated
+
     def record_attributed_outcome(
         self,
         entry: ExecutionIntent,
@@ -107,7 +128,7 @@ class SQLiteDemoExecutionRepository:
             entry.intent_id,
             entry.symbol,
             entry.direction.value,
-            canonical_decimal(entry.quantity),
+            canonical_decimal(entry.filled_quantity or entry.quantity),
             exchange_order_id,
             closed_at.isoformat(),
             canonical_decimal(closed_pnl),
@@ -169,7 +190,7 @@ class SQLiteDemoExecutionRepository:
                 (
                     entry.risk_reservation_id, entry.intent_id, reason,
                     entry.symbol, entry.direction.value,
-                    canonical_decimal(entry.quantity), now, now,
+                    canonical_decimal(entry.filled_quantity or entry.quantity), now, now,
                 ),
             )
 
@@ -191,6 +212,7 @@ class SQLiteDemoExecutionRepository:
                     existing,
                     state=ExecutionIntentState.PLANNED,
                     exchange_order_id=None,
+                    filled_quantity=None,
                 )
                 if comparable != intent:
                     raise ValueError("Execution intent ID conflicts with stored input")
@@ -298,11 +320,21 @@ class SQLiteDemoExecutionRepository:
                     'acknowledged', 'working', 'filled',
                     'protection_verified', 'position_closed_pending',
                     'reconciliation_required'
-                )
+                ) OR ((state IN ('cancelled', 'rejected') AND kind IN ('entry', 'cancel_entry')
+                       OR state = 'close_confirmed')
+                    AND NOT EXISTS (SELECT 1 FROM demo_execution_events AS event
+                        WHERE event.intent_id = demo_execution_intents.intent_id
+                          AND event.event_type = 'risk_sync_completed'))
                 ORDER BY created_at
                 """
             ).fetchall()
             return [self._from_row(row) for row in rows]
+
+    def mark_risk_sync_completed(self, intent_id: str) -> None:
+        """Complete the durable terminal handoff only after all risk effects."""
+        with self._connection() as connection:
+            self._event(connection, intent_id, "risk_sync_completed", "risk_effects_persisted",
+                        datetime.now(timezone.utc).isoformat())
 
     def planned_intents(self) -> list[ExecutionIntent]:
         """Return durable plans awaiting their first exchange submission."""
@@ -473,6 +505,7 @@ class SQLiteDemoExecutionRepository:
                 else None
             ),
             exchange_order_id=row["exchange_order_id"],
+            filled_quantity=(Decimal(row["filled_quantity"]) if "filled_quantity" in row.keys() and row["filled_quantity"] else None),
         )
 
     @contextmanager

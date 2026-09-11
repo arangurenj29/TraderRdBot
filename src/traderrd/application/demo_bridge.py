@@ -18,6 +18,7 @@ from traderrd.domain.risk import (
     InitializeRiskEngine,
     PortfolioRiskEngine,
     ProposeRiskReservation,
+    ReservationStatus,
     TradeProposal,
 )
 from traderrd.infrastructure.bridge_repository import SQLiteDemoBridgeRepository
@@ -238,10 +239,16 @@ class DemoSignalBridgeService:
                 "Demo account contains an order not managed by TraderRd",
             )
         managed_positions: dict[tuple[str, object], Decimal] = {}
+        risk = self._risk.load_state()
         for intent in self._execution.managed_position_intents():
+            reservation = risk.reservations.get(intent.risk_reservation_id) if risk else None
+            if reservation is None or reservation.status not in {
+                ReservationStatus.PENDING, ReservationStatus.FILLED, ReservationStatus.CLOSE_REQUESTED,
+            }:
+                raise DemoBridgeError("unreserved_owned_position", "Owned exposure has inactive risk state; reconcile before admitting new entries")
             key = (intent.symbol, intent.direction)
             managed_positions[key] = managed_positions.get(key, Decimal("0")) + (
-                intent.quantity
+                intent.filled_quantity or intent.quantity
             )
         account_positions: dict[tuple[str, object], Decimal] = {}
         for position in snapshot.positions:

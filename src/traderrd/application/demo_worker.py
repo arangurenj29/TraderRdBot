@@ -330,7 +330,7 @@ class DemoSignalWorker:
         return submitted, blocked
 
     def _submit_intent(self, intent: ExecutionIntent, rules) -> tuple[int, int]:
-        service = DemoExecutionService(self._client, self._execution, rules)
+        service = DemoExecutionService(self._client, self._execution, rules, clock=self._clock)
         current = self._execution.get(intent.intent_id)
         if current is None:
             current = self._execution.save_planned(intent)
@@ -352,7 +352,7 @@ class DemoSignalWorker:
             else:
                 if recovered.state is not ExecutionIntentState.PLANNED:
                     return 0, 0
-        if intent.kind is not ExecutionIntentKind.CANCEL_ENTRY:
+        if intent.kind is ExecutionIntentKind.CLOSE_POSITION:
             self._execution.mark_submission_attempt(intent.intent_id)
         before = current.state
         stored = service.submit(current)

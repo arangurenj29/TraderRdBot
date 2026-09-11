@@ -10,6 +10,7 @@ from typing import Iterator
 from traderrd.application.risk_engine import (
     RiskExecutionResult,
     command_digest,
+    command_from_dict,
     command_to_dict,
     decision_from_dict,
     decision_to_dict,
@@ -178,6 +179,15 @@ class SQLiteRiskStateRepository:
             if "no such table" in str(exc):
                 return None
             raise
+
+    def get_command(self, command_id: str) -> RiskCommand | None:
+        """Read the immutable input for recovery of interrupted local effects."""
+        with self._connection(readonly=True) as connection:
+            row = connection.execute(
+                "SELECT input_json FROM risk_engine_commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+        return command_from_dict(json.loads(row["input_json"])) if row else None
 
     def get_command_result(self, command_id: str) -> RiskExecutionResult | None:
         if not self._database_path.is_file():
