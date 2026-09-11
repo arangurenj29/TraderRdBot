@@ -139,12 +139,32 @@ class TraderStatusReader:
     def _heartbeat_events(connection: sqlite3.Connection) -> list[sqlite3.Row]:
         if not _table_exists(connection, "component_heartbeats"):
             return []
+        # Consumers need only latest/latest-healthy/latest-error per component
+        # and the newest 20 global errors. Select their IDs in one snapshot;
+        # never transfer the append-only history into every TUI refresh.
+        selections: list[str] = []
+        parameters: list[str] = []
+        for component in HEARTBEAT_COMPONENTS:
+            for state in (None, "healthy", "error"):
+                predicate = "component = ?"
+                parameters.append(component)
+                if state is not None:
+                    predicate += " AND state = ?"
+                    parameters.append(state)
+                selections.append(
+                    "SELECT id FROM (SELECT id FROM component_heartbeats WHERE "
+                    + predicate + " ORDER BY id DESC LIMIT 1)"
+                )
+        selections.append(
+            "SELECT id FROM (SELECT id FROM component_heartbeats "
+            "WHERE state = 'error' ORDER BY id DESC LIMIT 20)"
+        )
         return connection.execute(
-            """
-            SELECT component, state, observed_at, operation, error_code
-            FROM component_heartbeats
-            ORDER BY id ASC
-            """
+            "WITH selected_ids AS (" + " UNION ".join(selections) + ") "
+            "SELECT component, state, observed_at, operation, error_code "
+            "FROM component_heartbeats WHERE id IN (SELECT id FROM selected_ids) "
+            "ORDER BY id ASC",
+            parameters,
         ).fetchall()
 
     @staticmethod
