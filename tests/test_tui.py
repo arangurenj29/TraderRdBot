@@ -104,6 +104,61 @@ class TuiRenderTests(unittest.TestCase):
         self.assertTrue(any("DEMO ONLY" in line for line in screen.rendered))
         self.assertFalse(any("LIVE LOGS" in line for line in screen.rendered))
 
+    def test_performance_summary_displays_global_win_rate_beside_wins_and_losses(self) -> None:
+        for wins, losses, win_rate, expected in (
+            (33, 15, "0.6875", "68.75%"),
+            (0, 3, "0", "0.00%"),
+        ):
+            with self.subTest(win_rate=win_rate):
+                payload = self._payload()
+                payload["performance"]["overall"].update(
+                    closed_trades=wins + losses, wins=wins, losses=losses,
+                    win_rate=win_rate,
+                )
+                payload["performance"]["coverage"] = {
+                    "complete": True, "first_attributed_close_at": "2026-08-21T00:00:00+00:00",
+                }
+                screen = self._Screen(width=160)
+                dashboard = TerminalDashboard("missing.sqlite3")
+                dashboard._screen = screen
+                dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+                dashboard.step(force=True)
+
+                summary = next(line for line in screen.rendered if line.startswith("net "))
+                self.assertIn(f"W/L {wins}/{losses} · win {expected} · complete · since 2026-08-21", summary)
+
+    def test_performance_summary_uses_status_win_rate_excluding_breakeven(self) -> None:
+        payload = self._payload()
+        payload["performance"]["overall"].update(
+            closed_trades=5, wins=3, losses=1, breakeven=1, win_rate="0.75",
+        )
+        screen = self._Screen(width=160)
+        dashboard = TerminalDashboard("missing.sqlite3")
+        dashboard._screen = screen
+        dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+        dashboard.step(force=True)
+
+        summary = next(line for line in screen.rendered if line.startswith("net "))
+        self.assertIn("trades 5 · W/L 3/1 · win 75.00% · PARTIAL", summary)
+
+    def test_performance_summary_shows_unavailable_win_rate_without_inventing_zero(self) -> None:
+        for win_rate in (None, "invalid", "NaN", "Infinity"):
+            with self.subTest(win_rate=win_rate):
+                payload = self._payload()
+                payload["performance"]["overall"]["win_rate"] = win_rate
+                screen = self._Screen(width=160)
+                dashboard = TerminalDashboard("missing.sqlite3")
+                dashboard._screen = screen
+                dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+                dashboard.step(force=True)
+
+                summary = next(line for line in screen.rendered if line.startswith("net "))
+                self.assertIn("W/L 0/0 · win N/A · PARTIAL", summary)
+                self.assertNotIn("0.00%", summary)
+
     def test_question_mark_toggles_help_and_small_screen_renders_safely(self) -> None:
         screen = self._Screen(key=ord("?"), height=18, width=76)
         dashboard = TerminalDashboard("missing.sqlite3")

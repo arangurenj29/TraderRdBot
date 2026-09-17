@@ -92,9 +92,9 @@ def pair_performance_lines(payload: dict[str, Any], *, limit: int) -> list[str]:
     return rows or ["Per pair: no readable attributed ledger rows"]
 
 
-def _percent(value: Any) -> str:
+def _percent(value: Any, *, unavailable: str = "unknown") -> str:
     parsed = _decimal(value)
-    return "unknown" if parsed is None else f"{parsed * Decimal('100'):.2f}%"
+    return unavailable if parsed is None else f"{parsed * Decimal('100'):.2f}%"
 
 def _decimal(value: Any) -> Decimal | None:
     try:
@@ -312,7 +312,7 @@ class TerminalDashboard:
         self._add(performance_row, 1, "PERFORMANCE", self._accent_attr() | curses.A_BOLD)
         coverage = payload.get("performance", {}).get("coverage", {})
         coverage_label = "complete" if coverage.get("complete") else "PARTIAL"
-        self._add(performance_row, 16, f"net {_money(performance.get('net_pnl'))} · trades {performance.get('closed_trades', 0)} · W/L {performance.get('wins', 0)}/{performance.get('losses', 0)} · {coverage_label} · since {self._short_date(coverage.get('first_attributed_close_at'))}", self._pnl_attr(performance.get('net_pnl')))
+        self._add(performance_row, 16, f"net {_money(performance.get('net_pnl'))} · trades {performance.get('closed_trades', 0)} · W/L {performance.get('wins', 0)}/{performance.get('losses', 0)} · win {_percent(performance.get('win_rate'), unavailable='N/A')} · {coverage_label} · since {self._short_date(coverage.get('first_attributed_close_at'))}", self._pnl_attr(performance.get('net_pnl')))
         next_row = performance_row + 1
         projection_row = next_row
         if footer_row - next_row >= 3:
