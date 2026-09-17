@@ -16,6 +16,7 @@ from traderrd.domain.risk import (
     EngineMode,
     InitializeRiskEngine,
     ManualRearm,
+    RequestPositionClose,
     PortfolioRiskEngine,
     PortfolioState,
     ProposeRiskReservation,
@@ -143,6 +144,8 @@ def command_from_dict(payload: dict[str, Any]) -> RiskCommand:
             reservation_id=_required_text(payload, "reservation_id"),
             mark_equity=_decimal(payload, "mark_equity"),
         )
+    if command_type == "request_close":
+        return RequestPositionClose(**common, reservation_id=_required_text(payload, "reservation_id"))
     if command_type == "manual_rearm":
         return ManualRearm(
             **common,
@@ -201,6 +204,8 @@ def command_to_dict(command: RiskCommand) -> dict[str, Any]:
             reservation_id=command.reservation_id,
             mark_equity=command.mark_equity,
         )
+    if isinstance(command, RequestPositionClose):
+        return _simple_command(command, "request_close", reservation_id=command.reservation_id)
     return _simple_command(
         command,
         "manual_rearm",

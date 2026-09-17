@@ -46,6 +46,26 @@ class DemoAccountPosition:
     symbol: str
     direction: Direction
     quantity: Decimal
+    average_price: Decimal | None = None
+    mark_price: Decimal | None = None
+    liquidation_price: Decimal | None = None
+    unrealised_pnl: Decimal | None = None
+    leverage: Decimal | None = None
+    position_margin: Decimal | None = None
+    take_profit: Decimal | None = None
+    stop_loss: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not self.quantity.is_finite() or self.quantity <= 0:
+            raise ValueError("Demo position quantity must be positive")
+        unsigned = (
+            self.average_price, self.mark_price, self.liquidation_price,
+            self.leverage, self.position_margin, self.take_profit, self.stop_loss,
+        )
+        if any(value is not None and (not value.is_finite() or value <= 0) for value in unsigned):
+            raise ValueError("Demo position metrics must be finite and positive")
+        if self.unrealised_pnl is not None and not self.unrealised_pnl.is_finite():
+            raise ValueError("Demo position unrealised P&L must be finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,12 +85,25 @@ class DemoStrategyAccountSnapshot:
     captured_at: datetime
     positions: tuple[DemoAccountPosition, ...]
     orders: tuple[DemoAccountOrder, ...]
+    wallet_balance: Decimal | None = None
+    unrealised_pnl: Decimal | None = None
+    available_balance: Decimal | None = None
+    position_initial_margin: Decimal | None = None
+    order_initial_margin: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.captured_at.tzinfo is None:
             raise ValueError("Account snapshot timestamp must be timezone-aware")
         if not self.equity.is_finite() or self.equity <= 0:
             raise ValueError("Strategy account equity must be positive")
+        unsigned = (
+            self.wallet_balance, self.available_balance,
+            self.position_initial_margin, self.order_initial_margin,
+        )
+        if any(value is not None and (not value.is_finite() or value < 0) for value in unsigned):
+            raise ValueError("Demo account metrics must be finite and non-negative")
+        if self.unrealised_pnl is not None and not self.unrealised_pnl.is_finite():
+            raise ValueError("Demo account unrealised P&L must be finite")
 
 
 @dataclass(frozen=True, slots=True)

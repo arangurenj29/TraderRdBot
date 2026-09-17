@@ -25,8 +25,9 @@ class TuiTests(unittest.TestCase):
 
     def test_projection_fails_closed_on_missing_prices(self) -> None:
         result = projection_from_status({"execution": {"active_intents": [{"kind": "entry", "direction": "LONG"}]}, "risk": {}})
-        self.assertEqual(result.target_pnl, Decimal("0"))
-        self.assertEqual(result.stop_pnl, Decimal("0"))
+        self.assertIsNone(result.target_pnl)
+        self.assertIsNone(result.stop_pnl)
+        self.assertEqual(result.covered_entry_count, 0)
         self.assertIsNone(result.available_slots)
 
     def test_pair_performance_rows_include_win_rate_and_net_pnl_with_empty_state(self) -> None:
@@ -71,7 +72,10 @@ class TuiRenderTests(unittest.TestCase):
             self.refreshed = False
         def getmaxyx(self) -> tuple[int, int]: return self.height, self.width
         def erase(self) -> None: pass
-        def addnstr(self, row: int, column: int, text: str, width: int, attr: int = 0) -> None: self.rendered.append(text)
+        def addnstr(self, row: int, column: int, text: str, width: int, attr: int = 0) -> None:
+            if not 0 <= row < self.height or not 0 <= column < self.width:
+                raise AssertionError(f"render outside screen: {row},{column}")
+            self.rendered.append(text)
         def refresh(self) -> None: self.refreshed = True
         def getch(self) -> int: return self.key
         def keypad(self, _: bool) -> None: pass
@@ -100,6 +104,61 @@ class TuiRenderTests(unittest.TestCase):
         self.assertTrue(any("DEMO ONLY" in line for line in screen.rendered))
         self.assertFalse(any("LIVE LOGS" in line for line in screen.rendered))
 
+    def test_performance_summary_displays_global_win_rate_beside_wins_and_losses(self) -> None:
+        for wins, losses, win_rate, expected in (
+            (33, 15, "0.6875", "68.75%"),
+            (0, 3, "0", "0.00%"),
+        ):
+            with self.subTest(win_rate=win_rate):
+                payload = self._payload()
+                payload["performance"]["overall"].update(
+                    closed_trades=wins + losses, wins=wins, losses=losses,
+                    win_rate=win_rate,
+                )
+                payload["performance"]["coverage"] = {
+                    "complete": True, "first_attributed_close_at": "2026-08-21T00:00:00+00:00",
+                }
+                screen = self._Screen(width=160)
+                dashboard = TerminalDashboard("missing.sqlite3")
+                dashboard._screen = screen
+                dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+                dashboard.step(force=True)
+
+                summary = next(line for line in screen.rendered if line.startswith("net "))
+                self.assertIn(f"W/L {wins}/{losses} · win {expected} · complete · since 2026-08-21", summary)
+
+    def test_performance_summary_uses_status_win_rate_excluding_breakeven(self) -> None:
+        payload = self._payload()
+        payload["performance"]["overall"].update(
+            closed_trades=5, wins=3, losses=1, breakeven=1, win_rate="0.75",
+        )
+        screen = self._Screen(width=160)
+        dashboard = TerminalDashboard("missing.sqlite3")
+        dashboard._screen = screen
+        dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+        dashboard.step(force=True)
+
+        summary = next(line for line in screen.rendered if line.startswith("net "))
+        self.assertIn("trades 5 · W/L 3/1 · win 75.00% · PARTIAL", summary)
+
+    def test_performance_summary_shows_unavailable_win_rate_without_inventing_zero(self) -> None:
+        for win_rate in (None, "invalid", "NaN", "Infinity"):
+            with self.subTest(win_rate=win_rate):
+                payload = self._payload()
+                payload["performance"]["overall"]["win_rate"] = win_rate
+                screen = self._Screen(width=160)
+                dashboard = TerminalDashboard("missing.sqlite3")
+                dashboard._screen = screen
+                dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+                dashboard.step(force=True)
+
+                summary = next(line for line in screen.rendered if line.startswith("net "))
+                self.assertIn("W/L 0/0 · win N/A · PARTIAL", summary)
+                self.assertNotIn("0.00%", summary)
+
     def test_question_mark_toggles_help_and_small_screen_renders_safely(self) -> None:
         screen = self._Screen(key=ord("?"), height=18, width=76)
         dashboard = TerminalDashboard("missing.sqlite3")
@@ -109,6 +168,58 @@ class TuiRenderTests(unittest.TestCase):
         self.assertTrue(dashboard._show_help)
         self.assertTrue(any("HELP" in line for line in screen.rendered))
         self.assertFalse(any("LIVE LOGS" in line for line in screen.rendered))
+
+    def test_small_screen_with_multiple_exposures_never_renders_outside_bounds(self) -> None:
+        payload = self._payload()
+        payload["execution"]["active_intents"] = [
+            {"intent_id": f"i{index}", "kind": "entry", "symbol": "BTCUSDT", "direction": "LONG",
+             "state": "working", "quantity": "1", "price": "100", "take_profit": "105", "stop_loss": "97"}
+            for index in range(6)
+        ]
+        screen = self._Screen(key=ord("?"), height=18, width=76)
+        dashboard = TerminalDashboard("missing.sqlite3")
+        dashboard._screen = screen
+        dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+        self.assertTrue(dashboard.step(force=True))
+        self.assertTrue(any("outside view" in line for line in screen.rendered))
+
+    def test_operational_blocker_overrides_healthy_visual_claim(self) -> None:
+        payload = self._payload()
+        payload["operations"] = {
+            "status": "blocked", "can_open_new_positions": False,
+            "attention": [{"code": "risk_killed", "severity": "critical", "message": "Risk circuit breaker is latched"}],
+        }
+        screen = self._Screen()
+        dashboard = TerminalDashboard("missing.sqlite3")
+        dashboard._screen = screen
+        dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+        dashboard.step(force=True)
+
+        self.assertTrue(any("TRADING BLOCKED" in line for line in screen.rendered))
+        self.assertTrue(any("REQUIRES ATTENTION" in line for line in screen.rendered))
+
+    def test_exposure_navigation_opens_persisted_market_detail(self) -> None:
+        payload = self._payload()
+        payload["execution"]["active_intents"] = [{
+            "intent_id": "i1", "kind": "entry", "symbol": "BTCUSDT", "direction": "LONG",
+            "state": "protection_verified", "quantity": "2", "filled_quantity": "1.5",
+            "reserved_risk": "15", "risk_status": "filled", "price": "100",
+            "take_profit": "105", "stop_loss": "97", "expires_at": None,
+            "position": {"average_price": "101", "mark_price": "103", "unrealised_pnl": "3",
+                         "liquidation_price": "50", "leverage": "10", "position_margin": "15",
+                         "take_profit": "105", "stop_loss": "97", "captured_at": "2026-08-19T05:00:00+00:00"},
+        }]
+        screen = self._Screen(key=10)
+        dashboard = TerminalDashboard("missing.sqlite3")
+        dashboard._screen = screen
+        dashboard._reader = type("Reader", (), {"read": lambda _: payload})()
+
+        dashboard.step(force=True)
+
+        self.assertTrue(any("Average 101" in line for line in screen.rendered))
+        self.assertTrue(any("Liquidation 50" in line for line in screen.rendered))
 
 
 class TuiColorTests(unittest.TestCase):

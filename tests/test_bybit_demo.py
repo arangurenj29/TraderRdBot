@@ -571,7 +571,37 @@ class DemoAccountSnapshotTests(unittest.TestCase):
         self.assertEqual(rules.symbol, "BTCUSDT")
         self.assertEqual(snapshot.positions, ())
         self.assertEqual(snapshot.orders, ())
+        self.assertIsNone(snapshot.available_balance)
+        self.assertIsNone(snapshot.position_initial_margin)
         self.assertTrue(all(method == "GET" for method, _, _ in client.calls))
+
+    def test_captures_optional_position_metrics_for_read_only_observability(self) -> None:
+        class PositionClient(FakeSnapshotClient):
+            def request(self, method, path, params=None, body=None, private=True):
+                payload = super().request(method, path, params, body, private)
+                if path == "/v5/position/list":
+                    payload["result"]["list"] = [{
+                        "positionIdx": 0, "symbol": "BTCUSDT", "side": "Buy", "size": "2",
+                        "avgPrice": "100", "markPrice": "105", "liqPrice": "50",
+                        "unrealisedPnl": "10", "leverage": "10", "positionIM": "20",
+                        "takeProfit": "108", "stopLoss": "97",
+                    }]
+                if path == "/v5/account/wallet-balance":
+                    coin = payload["result"]["list"][0]["coin"][0]
+                    coin.update({"totalPositionIM": "20", "totalOrderIM": "5", "locked": "5", "bonus": "0"})
+                return payload
+
+        snapshot, _ = BybitDemoAccountSnapshotProvider(
+            PositionClient(), clock_ms=lambda: 1000000  # type: ignore[arg-type]
+        ).fetch("BTCUSDT")
+
+        position = snapshot.positions[0]
+        self.assertEqual(position.mark_price, Decimal("105"))
+        self.assertEqual(position.unrealised_pnl, Decimal("10"))
+        self.assertEqual(position.liquidation_price, Decimal("50"))
+        self.assertEqual(snapshot.wallet_balance, Decimal("1000"))
+        self.assertEqual(snapshot.available_balance, Decimal("970"))
+        self.assertEqual(snapshot.position_initial_margin, Decimal("20"))
 
     def test_rejects_inconsistent_reported_equity_without_payload_details(self) -> None:
         wallet = {

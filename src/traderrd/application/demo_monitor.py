@@ -16,6 +16,7 @@ from traderrd.domain.risk import (
     PortfolioRiskEngine,
     RiskActionType,
     ReservationStatus,
+    RequestPositionClose,
 )
 from traderrd.infrastructure.execution_repository import (
     SQLiteDemoExecutionRepository,
@@ -59,6 +60,77 @@ class DemoLifecycleMonitor:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._risk_engine = PortfolioRiskEngine()
 
+    def close_owned_position(self, intent_id: str):
+        """Explicit operator recovery: evidence, durable close request, then flat/PnL."""
+        if getattr(getattr(self._client, "config", None), "base_url", None) != "https://api-demo.bybit.com":
+            raise DemoMonitorError("demo_only_guard", "Operator close is restricted to Bybit Demo Trading")
+        entry = self._execution.get(intent_id)
+        if entry is None or entry.kind.value != "entry":
+            raise DemoMonitorError("close_guard", "Select an owned entry intent")
+        snapshot, rules = self._snapshots.fetch(entry.symbol)
+        self._validate_ownership(snapshot)
+        now = self._clock()
+        state = self._risk.load_state()
+        reservation = state.reservations.get(entry.risk_reservation_id) if state else None
+        if reservation is None or reservation.status not in {
+            ReservationStatus.PENDING, ReservationStatus.FILLED,
+            ReservationStatus.CLOSE_REQUESTED, ReservationStatus.CLOSED,
+        }:
+            raise DemoMonitorError("close_guard", "Owned reservation requires reconciliation")
+        service = DemoExecutionService(self._client, self._execution, rules, clock=self._clock)
+        close = self._execution.find_close(entry.risk_reservation_id)
+        if reservation.status is ReservationStatus.CLOSED:
+            if any(position.symbol == entry.symbol and position.quantity != 0 for position in snapshot.positions):
+                raise DemoMonitorError("close_guard", "Closed reservation has reopened exposure")
+            if not self._execution.outcome_is_attributed(entry.risk_reservation_id):
+                raise DemoMonitorError("close_guard", "Closed reservation has no attributed outcome")
+            self._execution.transition(entry.intent_id, ExecutionIntentState.POSITION_CLOSED,
+                "operator_close_risk_released", "risk_close_confirmed; exit_reason_unknown")
+            if close is not None:
+                self._execution.mark_risk_sync_completed(close.intent_id)
+            return close or self._execution.get(entry.intent_id)
+        already_flat = None
+        if close is None or (close.state is ExecutionIntentState.PLANNED
+                             and not self._execution.has_submission_attempt(close.intent_id)):
+            filled = service.reconcile_for_operator_close(entry.intent_id)
+            if filled.state is ExecutionIntentState.POSITION_CLOSED_PENDING:
+                already_flat = filled
+                filled = replace(filled, state=ExecutionIntentState.FILLED)
+            self._sync_risk(filled, snapshot, rules, now)
+        state = self._risk.load_state()
+        command_id = f"demo-operator-close:{entry.intent_id}"
+        command = self._risk.get_command(command_id) or RequestPositionClose(
+            command_id, max(self._clock(), snapshot.captured_at, state.as_of), entry.risk_reservation_id,
+        )
+        if not isinstance(command, RequestPositionClose) or command.reservation_id != entry.risk_reservation_id:
+            raise DemoMonitorError("close_guard", "Operator close command identity conflicts")
+        result = self._risk.execute(command, self._risk_engine)
+        if result.decision.status not in {"accepted", "duplicate"}:
+            raise DemoMonitorError("risk_sync_rejected", "Operator close was not accepted by risk ledger")
+        if already_flat is not None:
+            if close is not None:
+                self._execution.transition(close.intent_id, ExecutionIntentState.CANCELLED,
+                    "operator_close_not_needed", "owned_position_already_flat")
+            if service.attribute_closed_outcome(already_flat, self._clock()):
+                self._sync_risk(already_flat, snapshot, rules, self._clock())
+            return self._execution.get(entry.intent_id)
+        close = self._execution.find_close(entry.risk_reservation_id)
+        if close is None:
+            self._materialize_follow_up_actions(command_id, result, rules)
+            close = self._execution.find_close(entry.risk_reservation_id)
+        if close is None:
+            raise DemoMonitorError("close_guard", "Owned close plan unavailable")
+        if close.state is ExecutionIntentState.PLANNED:
+            close = service.submit(close)
+        close = service.reconcile(close.intent_id)
+        if close.state is ExecutionIntentState.CLOSE_CONFIRMED and service.attribute_closed_outcome(close, self._clock()):
+            fresh, _ = self._snapshots.fetch(entry.symbol)
+            self._validate_ownership(fresh)
+            self._sync_risk(close, fresh, rules, self._clock())
+            self._execution.transition(entry.intent_id, ExecutionIntentState.POSITION_CLOSED,
+                "operator_close_risk_released", "risk_close_confirmed; exit_reason_unknown")
+        return close
+
     def run_cycle(self) -> DemoMonitorResult:
         now = self._clock()
         if now.tzinfo is None:
@@ -71,6 +143,7 @@ class DemoLifecycleMonitor:
         for symbol in {intent.symbol for intent in intents}:
             snapshot, rules = self._snapshots.fetch(symbol)
             self._validate_ownership(snapshot)
+            self._execution.record_account_snapshot(snapshot)
             snapshots[symbol] = (snapshot, rules)
 
         risk_updates = 0
@@ -259,17 +332,18 @@ class DemoLifecycleMonitor:
         self, command_id: str, result, rules: InstrumentRules
     ) -> None:
         """Persist follow-up close/reversal plans for the signal worker."""
-        persisted = self._risk.get_command(command_id)
-        completed_cancel = None
-        if isinstance(persisted, CancelPendingReservation) and result.decision.status in {"accepted", "duplicate"}:
-            entry = self._execution.find_entry(persisted.reservation_id)
-            if entry is not None and entry.state is ExecutionIntentState.CANCELLED:
-                completed_cancel = persisted.reservation_id
+        def completed_parent(action) -> bool:
+            if action.action_type is not RiskActionType.CANCEL_PENDING:
+                return False
+            entry = self._execution.find_entry(action.reservation_id)
+            return entry is not None and entry.state in {
+                ExecutionIntentState.CANCELLED, ExecutionIntentState.REJECTED,
+                ExecutionIntentState.POSITION_CLOSED,
+            }
         actions = tuple(
             action
             for action in result.decision.actions
-            if not (action.action_type is RiskActionType.CANCEL_PENDING
-                    and action.reservation_id == completed_cancel)
+            if not completed_parent(action)
             if action.action_type
             in {
                 RiskActionType.CREATE_PENDING_POST_ONLY,

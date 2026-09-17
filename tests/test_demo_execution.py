@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 import sqlite3
 import json
@@ -90,14 +91,14 @@ class FakeExecutionClient:
                 "retCode": 0,
                 "result": {
                     "list": [
-                        {"orderLinkId": link, "orderStatus": self.order_status, "cumExecQty": "4.838" if self.order_status == "Filled" else "0"}
+                        {"orderId": "exchange-order-1", "symbol": str(values["symbol"]), "orderLinkId": link, "orderStatus": self.order_status, "cumExecQty": "4.838" if self.order_status == "Filled" else "0"}
                     ]
                 },
             }
         if path == "/v5/execution/list":
             return {
                 "retCode": 0,
-                "result": {"list": [{"execId": "execution-1", "execQty": "4.838"}]},
+                "result": {"list": [{"execId": "execution-1", "execQty": "4.838", "orderId": "exchange-order-1", "orderLinkId": str(values["orderLinkId"]), "symbol": str(values["symbol"]), "side": "Sell" if str(values["orderLinkId"]).startswith("trd-demo-c-") else "Buy"}]},
             }
         if path == "/v5/position/closed-pnl":
             if self.closed_pnl_rows is not None:
@@ -198,6 +199,11 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
         state = SQLiteRiskStateRepository(self.database_path).load_state()
         self.assertEqual(state.reservations[self.entry.risk_reservation_id].status.value, "filled")
         self.assertGreater(state.total_reserved_risk, 0)
+        with sqlite3.connect(self.database_path) as connection:
+            persisted = connection.execute(
+                "SELECT captured_at, equity FROM demo_account_snapshots WHERE singleton_id = 1"
+            ).fetchone()
+        self.assertEqual(persisted, (snapshot.captured_at.isoformat(), "1000"))
 
     def test_expired_unsent_entry_never_reaches_exchange(self) -> None:
         self.service._clock = lambda: START + timedelta(hours=4)
@@ -501,6 +507,93 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
         self.assertFalse(any(item.kind is ExecutionIntentKind.CANCEL_ENTRY for item in self.execution_repository.monitorable_intents()))
         self.assertEqual(SQLiteRiskStateRepository(self.database_path).counts(), before)
 
+    def test_closed_parent_suppresses_materialization_and_retires_twelve_persisted_cancels(self) -> None:
+        self.test_operator_close_recovers_pagination_without_stale_protection_and_is_idempotent()
+        risk = SQLiteRiskStateRepository(self.database_path)
+        command_id = f"demo-operator-close:{self.entry.intent_id}"
+        result = risk.get_command_result(command_id)
+        result = replace(result, decision=replace(result.decision, actions=(RiskAction(
+            RiskActionType.CANCEL_PENDING, self.entry.risk_reservation_id,
+            self.entry.symbol, self.entry.direction, self.entry.quantity, reason="historical"),)))
+        self._monitor_at()._materialize_follow_up_actions(command_id, result, RULES)
+        self.assertEqual(self.execution_repository.planned_intents(), [])
+        template = DemoExecutionPlanner.plan_decision(RULES, command_id, result.decision, result.state)[0]
+        before = risk.counts()
+        self.client.realtime_empty = True
+        self.client.calls.clear()
+        for index in range(12):
+            plan = replace(template, intent_id=f"post-close-cancel-{index}")
+            self.execution_repository.save_planned(plan)
+            self.assertEqual(self.service.submit(plan).state, ExecutionIntentState.CANCELLED)
+            restarted = DemoExecutionService(self.client, self.execution_repository, RULES)
+            self.assertEqual(restarted.reconcile(plan.intent_id).state, ExecutionIntentState.CANCELLED)
+        self._monitor_at().run_cycle()
+        self.assertEqual(risk.counts(), before)
+        self.assertEqual(self.execution_repository.planned_intents(), [])
+        self.assertFalse(any(method == "POST" for method, _, _ in self.client.calls))
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id).state, ExecutionIntentState.POSITION_CLOSED)
+
+    def test_closed_parent_cancel_consumes_terminal_order_pages_and_rejects_ambiguity(self) -> None:
+        self.test_operator_close_recovers_pagination_without_stale_protection_and_is_idempotent()
+        risk = SQLiteRiskStateRepository(self.database_path)
+        command_id = f"demo-operator-close:{self.entry.intent_id}"
+        result = risk.get_command_result(command_id)
+        decision = replace(result.decision, actions=(RiskAction(
+            RiskActionType.CANCEL_PENDING, self.entry.risk_reservation_id,
+            self.entry.symbol, self.entry.direction, self.entry.quantity, reason="historical"),))
+        template = DemoExecutionPlanner.plan_decision(RULES, command_id, decision, result.state)[0]
+        original = self.client.request
+        row = {"orderLinkId": self.entry.order_link_id, "orderId": "exchange-order-1",
+               "symbol": "BTCUSDT", "orderStatus": "Filled", "cumExecQty": "4.838"}
+        pages = []
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/order/realtime" and params.get("openOnly") == "0":
+                return {"result": pages.pop(0)}
+            return original(method, path, params, body, **kwargs)
+        self.client.request = request
+        before = risk.counts()
+        for index, evidence in enumerate((
+            [{"list": [row], "nextPageCursor": "next"}, {"list": []}],
+            [{"list": [row], "nextPageCursor": "cycle"}, {"list": [], "nextPageCursor": "cycle"}],
+            [{"list": [], "nextPageCursor": str(n)} for n in range(10)],
+            [{"list": [row], "nextPageCursor": "next"}, {"list": [row]}],
+            [{"list": [row], "nextPageCursor": "next"}, {"list": [{**row, "orderLinkId": "external"}]}],
+        )):
+            pages[:] = evidence
+            plan = replace(template, intent_id=f"paged-retire-{index}")
+            self.execution_repository.save_planned(plan)
+            self.client.calls.clear()
+            with self.subTest(index=index):
+                if index == 0:
+                    self.assertEqual(self.service.submit(plan).state, ExecutionIntentState.CANCELLED)
+                    self.assertEqual(self.service.reconcile(plan.intent_id).state, ExecutionIntentState.CANCELLED)
+                else:
+                    with self.assertRaises(DemoExecutionError):
+                        self.service.submit(plan)
+                    self.assertNotEqual(self.execution_repository.get(plan.intent_id).state, ExecutionIntentState.CANCELLED)
+                self.assertFalse(any(method == "POST" for method, _, _ in self.client.calls))
+                self.assertEqual(risk.counts(), before)
+
+    def test_closed_parent_cancel_refuses_reopened_exposure_and_incomplete_accounting(self) -> None:
+        self.test_operator_close_recovers_pagination_without_stale_protection_and_is_idempotent()
+        risk = SQLiteRiskStateRepository(self.database_path)
+        command_id = f"demo-operator-close:{self.entry.intent_id}"
+        result = risk.get_command_result(command_id)
+        decision = replace(result.decision, actions=(RiskAction(
+            RiskActionType.CANCEL_PENDING, self.entry.risk_reservation_id,
+            self.entry.symbol, self.entry.direction, self.entry.quantity, reason="historical"),))
+        plan = DemoExecutionPlanner.plan_decision(RULES, command_id, decision, result.state)[0]
+        self.client.calls.clear()
+        self.client.flat_position = False
+        with self.assertRaises(DemoExecutionError):
+            self.service.submit(plan)
+        self.client.flat_position = True
+        with patch.object(self.execution_repository, "outcome_is_attributed", return_value=False):
+            with self.assertRaises(DemoExecutionError):
+                self.service.reconcile(plan.intent_id)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.client.calls))
+        self.assertEqual(self.execution_repository.get(plan.intent_id).state, ExecutionIntentState.RECONCILIATION_REQUIRED)
+
     def test_historical_cancel_with_current_exposure_does_not_retire(self) -> None:
         command_id, result = self._historical_cancel_confirmation()
         plan = DemoExecutionPlanner.plan_decision(RULES, command_id, result.decision, result.state)[0]
@@ -543,6 +636,213 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
         self.assertEqual(SQLiteRiskStateRepository(self.database_path).counts(), before)
         self.assertEqual(self.execution_repository.planned_intents(), [])
         self.assertEqual(self.execution_repository.monitorable_intents(), [])
+
+    def _execution_pages(self, pages):
+        self.service.submit(self.entry)
+        original = self.client.request
+        calls = []
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/execution/list":
+                calls.append(params)
+                page = pages[len(calls) - 1]
+                if isinstance(page, Exception):
+                    raise page
+                return {"result": page}
+            return original(method, path, params, body, **kwargs)
+        self.client.request = request
+        return calls
+
+    def test_execution_cursor_with_terminal_empty_page_confirms_fill(self) -> None:
+        calls = self._execution_pages([
+            {"list": [{"execId": "one", "execQty": "4.838"}], "nextPageCursor": "next"},
+            {"list": []},
+        ])
+        self.assertEqual(self.service.reconcile(self.entry.intent_id).state, ExecutionIntentState.PROTECTION_VERIFIED)
+        self.assertEqual(calls[1]["cursor"], "next")
+
+    def test_execution_multi_page_fill_sums_exact_quantity(self) -> None:
+        self._execution_pages([
+            {"list": [{"execId": "one", "execQty": "2"}], "nextPageCursor": "next"},
+            {"list": [{"execId": "two", "execQty": "2.838"}]},
+        ])
+        self.assertEqual(self.service.reconcile(self.entry.intent_id).filled_quantity, Decimal("4.838"))
+
+    def test_execution_repeated_cursor_fails_closed(self) -> None:
+        self._execution_pages([
+            {"list": [{"execId": "one", "execQty": "4.838"}], "nextPageCursor": "same"},
+            {"list": [], "nextPageCursor": "same"},
+        ])
+        with self.assertRaises(DemoExecutionError):
+            self.service.reconcile(self.entry.intent_id)
+        self.assertIsNone(self.execution_repository.get(self.entry.intent_id).filled_quantity)
+
+    def test_execution_page_budget_exhaustion_fails_closed(self) -> None:
+        calls = self._execution_pages([{"list": [], "nextPageCursor": str(n)} for n in range(10)])
+        with self.assertRaises(DemoExecutionError):
+            self.service.reconcile(self.entry.intent_id)
+        self.assertEqual(len(calls), 10)
+
+    def test_execution_duplicate_across_pages_is_not_double_counted(self) -> None:
+        self._execution_pages([
+            {"list": [{"execId": "same", "execQty": "2"}], "nextPageCursor": "next"},
+            {"list": [{"execId": "same", "execQty": "2.838"}]},
+        ])
+        self.assertEqual(self.service.reconcile(self.entry.intent_id).state, ExecutionIntentState.RECONCILIATION_REQUIRED)
+        self.assertIsNone(self.execution_repository.get(self.entry.intent_id).filled_quantity)
+
+    def test_execution_second_page_network_failure_does_not_persist_partial_evidence(self) -> None:
+        self._execution_pages([
+            {"list": [{"execId": "one", "execQty": "4.838"}], "nextPageCursor": "next"},
+            DemoExecutionError("network", "unavailable"),
+        ])
+        with self.assertRaises(DemoExecutionError):
+            self.service.reconcile(self.entry.intent_id)
+        self.assertIsNone(self.execution_repository.get(self.entry.intent_id).filled_quantity)
+
+    def test_operator_close_recovers_pagination_without_stale_protection_and_is_idempotent(self) -> None:
+        self.service.submit(self.entry)
+        self.execution_repository.transition(self.entry.intent_id, ExecutionIntentState.RECONCILIATION_REQUIRED,
+                                             "incomplete_execution_evidence", "test")
+        self.client.config = SimpleNamespace(base_url="https://api-demo.bybit.com")
+        original = self.client.request
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/position/trading-stop":
+                raise AssertionError("stale protection must not be installed before authorized close")
+            if path == "/v5/execution/list" and params["orderLinkId"] == self.entry.order_link_id:
+                return {"result": {"list": []}} if params.get("cursor") else {"result": {
+                    "list": [{"execId": "entry-fill", "execQty": "4.838"}], "nextPageCursor": "terminal-empty"}}
+            if path == "/v5/order/create" and body.get("reduceOnly"):
+                self.client.flat_position = True
+            return original(method, path, params, body, **kwargs)
+        self.client.request = request
+        monitor = self._monitor_at()
+        closed = monitor.close_owned_position(self.entry.intent_id)
+        before = SQLiteRiskStateRepository(self.database_path).counts()
+        self.assertEqual(closed.state, ExecutionIntentState.CLOSE_CONFIRMED)
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id).filled_quantity, Decimal("4.838"))
+        self.assertEqual(SQLiteRiskStateRepository(self.database_path).load_state().reservations[self.entry.risk_reservation_id].status.value, "closed")
+        self.assertTrue(self.execution_repository.outcome_is_attributed(self.entry.risk_reservation_id))
+        execution_before = self.execution_repository.counts()
+        self.assertEqual(monitor.close_owned_position(self.entry.intent_id), closed)
+        self.assertEqual(self.execution_repository.counts(), execution_before)
+        self.assertEqual(SQLiteRiskStateRepository(self.database_path).counts(), before)
+        closes = [body for method, path, body in self.client.calls if path == "/v5/order/create" and body.get("reduceOnly")]
+        self.assertEqual(len(closes), 1)
+        self.assertTrue(closes[0]["orderLinkId"].startswith("trd-demo-c-"))
+
+    def test_operator_close_rejects_foreign_duplicate_partial_and_ambiguous_executions(self) -> None:
+        self.service.submit(self.entry)
+        self.client.config = SimpleNamespace(base_url="https://api-demo.bybit.com")
+        original = self.client.request
+        evidence = []
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/order/create" and body.get("reduceOnly"):
+                self.client.flat_position = True
+            if path == "/v5/execution/list" and params["orderLinkId"] != self.entry.order_link_id:
+                return {"result": {"list": evidence}}
+            return original(method, path, params, body, **kwargs)
+        self.client.request = request
+        monitor = self._monitor_at()
+        for changes in (
+            {"execId": "foreign", "execQty": "0", "orderLinkId": "external", "symbol": "ETHUSDT"},
+            {"execQty": "1"}, {"side": "Buy"}, {"orderId": "foreign"},
+            {"execId": ""}, {"orderLinkId": ""},
+        ):
+            close = self.execution_repository.find_close(self.entry.risk_reservation_id)
+            link = close.order_link_id if close else "external"
+            evidence[:] = [{"execId": "close-fill", "execQty": "4.838", "orderLinkId": link,
+                            "symbol": "BTCUSDT", "side": "Sell", "orderId": "exchange-order-1", **changes}]
+            if changes.get("execId") == "foreign":
+                evidence.append(dict(evidence[0]))
+            with self.subTest(changes=changes):
+                result = monitor.close_owned_position(self.entry.intent_id)
+                self.assertEqual(result.state, ExecutionIntentState.RECONCILIATION_REQUIRED)
+                self.assertFalse(self.execution_repository.outcome_is_attributed(self.entry.risk_reservation_id))
+                self.assertNotEqual(SQLiteRiskStateRepository(self.database_path).load_state().reservations[self.entry.risk_reservation_id].status.value, "closed")
+
+    def test_operator_close_holds_shared_runtime_lock_through_operation(self) -> None:
+        from traderrd.demo_runtime import _exclusive_runtime_lock, _LOCK_NAME, DemoRuntimeAlreadyRunningError
+        from traderrd.demo_cli import run_demo_reconcile
+        def operation(*args, **kwargs):
+            with self.assertRaises(DemoRuntimeAlreadyRunningError):
+                with _exclusive_runtime_lock(Path(self.database_path).parent / _LOCK_NAME):
+                    pass
+            return 0
+        with patch("traderrd.demo_cli._run_demo_reconcile", side_effect=operation):
+            self.assertEqual(run_demo_reconcile(self.database_path, self.entry.intent_id, True,
+                                               close_owned_position=True), 0)
+        with _exclusive_runtime_lock(Path(self.database_path).parent / _LOCK_NAME):
+            pass
+
+    def test_operator_close_refuses_active_supervisor_before_loading_credentials(self) -> None:
+        self.service.submit(self.entry)
+        from traderrd.demo_runtime import _exclusive_runtime_lock, _LOCK_NAME
+        from traderrd.demo_cli import run_demo_reconcile
+        with _exclusive_runtime_lock(Path(self.database_path).parent / _LOCK_NAME), \
+             patch("traderrd.demo_cli.load_demo_client") as load:
+            self.assertEqual(run_demo_reconcile(self.database_path, self.entry.intent_id, True,
+                                               close_owned_position=True), 1)
+            load.assert_not_called()
+
+    def test_operator_close_requires_demo_endpoint_and_exact_position(self) -> None:
+        self.service.submit(self.entry)
+        self.client.config = SimpleNamespace(base_url="https://api.bybit.com")
+        with self.assertRaises(DemoMonitorError):
+            self._monitor_at().close_owned_position(self.entry.intent_id)
+        self.client.config.base_url = "https://api-demo.bybit.com"
+        self.client.position_side = "Sell"
+        with self.assertRaises(DemoExecutionError):
+            self._monitor_at().close_owned_position(self.entry.intent_id)
+        self.assertFalse(any(body.get("reduceOnly") for _, _, body in self.client.calls))
+
+    def test_operator_close_recovers_uncertain_post_once_and_preserves_single_close_record(self) -> None:
+        self.service.submit(self.entry)
+        self.client.config = SimpleNamespace(base_url="https://api-demo.bybit.com")
+        original = self.client.request
+        failed = False
+        def request(method, path, params=None, body=None, **kwargs):
+            nonlocal failed
+            if path == "/v5/position/trading-stop":
+                raise AssertionError("operator close cannot install protection")
+            if path == "/v5/order/create" and body.get("reduceOnly"):
+                self.client.flat_position = True
+                if not failed:
+                    failed = True
+                    original(method, path, params, body, **kwargs)
+                    raise DemoExecutionError("network", "POST outcome uncertain")
+            return original(method, path, params, body, **kwargs)
+        self.client.request = request
+        monitor = self._monitor_at()
+        with self.assertRaises(DemoExecutionError):
+            monitor.close_owned_position(self.entry.intent_id)
+        closed = monitor.close_owned_position(self.entry.intent_id)
+        self.assertEqual(closed.state, ExecutionIntentState.CLOSE_CONFIRMED)
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id).state, ExecutionIntentState.POSITION_CLOSED)
+        monitor.run_cycle()
+        with sqlite3.connect(self.database_path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM risk_engine_commands WHERE command_type='confirm_close'").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM demo_performance_outcomes WHERE status='attributed'").fetchone()[0], 1)
+        self.assertEqual(len([1 for _, path, body in self.client.calls if path == "/v5/order/create" and body.get("reduceOnly")]), 1)
+
+    def test_operator_close_cli_requires_explicit_apply_and_matching_command(self) -> None:
+        from traderrd.cli import main
+        for args in (["demo-reconcile", "--close-owned-position", "--intent-id", "owned"],
+                     ["status", "--close-owned-position", "--apply-demo-reconciliation"]):
+            with self.subTest(args=args), patch("sys.argv", ["traderrd", *args]), self.assertRaises(SystemExit):
+                main()
+        with patch("sys.argv", ["traderrd", "demo-reconcile", "--intent-id", "owned",
+                                "--apply-demo-reconciliation", "--close-owned-position"]), \
+             patch("traderrd.demo_cli.run_demo_reconcile", return_value=0) as invoke:
+            self.assertEqual(main(), 0)
+            self.assertTrue(invoke.call_args.kwargs["close_owned_position"])
+
+    def test_execution_foreign_evidence_on_later_page_is_rejected(self) -> None:
+        self._execution_pages([
+            {"list": [{"execId": "one", "execQty": "2"}], "nextPageCursor": "next"},
+            {"list": [{"execId": "two", "execQty": "2.838", "orderLinkId": "external"}]},
+        ])
+        self.assertEqual(self.service.reconcile(self.entry.intent_id).state, ExecutionIntentState.RECONCILIATION_REQUIRED)
+        self.assertIsNone(self.execution_repository.get(self.entry.intent_id).filled_quantity)
 
     def tearDown(self) -> None:
         self.directory.cleanup()
@@ -625,6 +925,7 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
 
     def test_close_is_reduce_only_and_requires_owned_filled_entry(self) -> None:
         self.execution_repository.save_planned(self.entry)
+        self.execution_repository.record_fill_quantity(self.entry.intent_id, self.entry.quantity)
         self.execution_repository.transition(
             self.entry.intent_id,
             ExecutionIntentState.FILLED,

@@ -17,6 +17,7 @@ from traderrd.domain.risk import (
     EngineMode,
     InitializeRiskEngine,
     ManualRearm,
+    RequestPositionClose,
     PortfolioRiskEngine,
     ProposeRiskReservation,
     ReservationStatus,
@@ -84,6 +85,16 @@ class PortfolioRiskEngineTests(unittest.TestCase):
                 proposal(signal_id, symbol, direction, stop_percent),
             ),
         )
+
+    def test_operator_close_clears_inverse_without_reopening_opposite(self) -> None:
+        self.propose("long", START + timedelta(minutes=1))
+        self.engine.process(self.state, ConfirmPendingFill("fill", START + timedelta(minutes=2), "long"))
+        self.propose("short", START + timedelta(minutes=3), direction=Direction.SHORT)
+        self.engine.process(self.state, RequestPositionClose("operator", START + timedelta(minutes=4), "long"))
+        self.engine.process(self.state, ConfirmPositionClosed("close", START + timedelta(minutes=5), "long", Decimal("1000")))
+        self.assertEqual(self.state.reversal_intents, {})
+        self.assertNotIn("short", self.state.reservations)
+        self.assertEqual(self.state.total_reserved_risk, 0)
 
     def test_precise_dynamic_sizing_includes_estimated_costs(self) -> None:
         transition = self.propose("signal-1", START + timedelta(minutes=1))

@@ -79,6 +79,10 @@ color pairs only with graceful monochrome fallback; never
 write raw ANSI sequences from the TUI. `q` or
 `Ctrl-C` stops all children cleanly; `--no-tui` retains prefixed logs. The TUI
 reads SQLite only and must never make exchange/Telegram calls or write state.
+It must distinguish process health from trading permission, label data-source
+freshness independently from screen refresh, and render unavailable market or
+performance evidence as `N/A`/partial rather than invented zero. Position and
+account metrics may be persisted only by the lifecycle monitor.
 If TTY/TERM capabilities are absent, `demo-run` states the exact reason and
 falls back visibly to prefixed logs. A render exception must cleanly stop all
 children and be surfaced to the operator. It owns a per-database lock and must
@@ -108,6 +112,16 @@ degraded components expose no start command and require investigation first.
 Stop the worker before the monitor and the
 observer; do not stop the monitor while owned positions or orders remain
 unreconciled.
+
+## Explicit owned close recovery
+
+With the supervised Demo runtime stopped, an operator may use `demo-reconcile
+--intent-id ENTRY_INTENT_ID --apply-demo-reconciliation --close-owned-position`.
+This proves bounded complete entry executions and the exact owned position before
+requesting its idempotent reduce-only close, without installing stale TP/SL first.
+It clears staged inverse intent and preserves normal closed-PnL/risk-close history.
+Pending/uncertain results must retry the same entry ID; never use manual exchange
+orders or SQLite edits. Resume supervision only after `risk_released=true`.
 
 ## Testing
 
@@ -160,3 +174,10 @@ order, cursor, risk, source-isolation, and restart/idempotency change.
   directly or restore without clearing stale WAL/SHM sidecars.
 - Server prerequisites must link to Docker's official Ubuntu Engine and Compose
   installation documentation; never add Docker installation scripts to this repo.
+
+The explicit applied owned-close command acquires the same operation lock as
+`demo-run` before loading credentials and holds it until reconciliation returns.
+Stop individually launched worker/monitor processes too: they do not own this
+supervisor lock. Close confirmation requires unique execution IDs, exact owned
+order/link, symbol, closing side and full cumulative filled quantity; flatness
+alone cannot release risk.

@@ -44,6 +44,10 @@ class SQLiteHeartbeatRepository:
                     ON component_heartbeats(component, id);
                 CREATE INDEX IF NOT EXISTS idx_component_heartbeats_errors
                     ON component_heartbeats(state, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_component_heartbeats_component_state_id
+                    ON component_heartbeats(component, state, id);
+                CREATE INDEX IF NOT EXISTS idx_component_heartbeats_state_id
+                    ON component_heartbeats(state, id);
                 """
             )
 

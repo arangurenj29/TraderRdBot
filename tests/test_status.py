@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from io import StringIO
 import json
 from pathlib import Path
@@ -8,12 +9,15 @@ import unittest
 from unittest.mock import patch
 
 from traderrd.application.ingestion import InboundTelegramEvent, SignalIngestionService
-from traderrd.application.status import TraderStatusReader, render_status
+from traderrd.application.status import TraderStatusReader, render_status, _component_snapshot, _recent_errors
 from traderrd.status_cli import _should_color
 from traderrd.cli import main
 from traderrd.domain.parser import SignalParser
+from traderrd.domain.bridge import DemoAccountPosition, DemoStrategyAccountSnapshot
+from traderrd.domain.models import Direction
 from traderrd.infrastructure.bridge_repository import SQLiteDemoBridgeRepository
 from traderrd.infrastructure.heartbeat_repository import SQLiteHeartbeatRepository
+from traderrd.infrastructure.execution_repository import SQLiteDemoExecutionRepository
 from traderrd.infrastructure.sqlite_repository import SQLiteSignalRepository
 from tests.samples import LONG_SIGNAL
 
@@ -26,6 +30,71 @@ class TraderStatusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.database = Path(self.directory.name) / "status.sqlite3"
+
+    def test_heartbeat_projection_is_bounded_with_large_history_and_preserves_summaries(self) -> None:
+        repository = SQLiteHeartbeatRepository(self.database)
+        repository.initialize()
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            for component in ("observer", "worker", "monitor"):
+                for state in ("starting", "healthy", "error"):
+                    connection.execute(
+                        "INSERT INTO component_heartbeats(component,state,observed_at,error_code) VALUES(?,?,?,?)",
+                        (component, state, NOW.isoformat(), "old_error" if state == "error" else None),
+                    )
+            connection.execute(
+                """WITH RECURSIVE history(n) AS (
+                    VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n < 550000
+                ) INSERT INTO component_heartbeats(component,state,observed_at)
+                SELECT 'worker','healthy',? FROM history""", (NOW.isoformat(),),
+            )
+            history_end = connection.execute("SELECT MAX(id) FROM component_heartbeats").fetchone()[0]
+            for index in range(40):
+                # Insertion order, not timestamp order, defines latest/error
+                # history. Preserve it even when wall-clock timestamps regress.
+                connection.execute(
+                    "INSERT INTO component_heartbeats(component,state,observed_at,error_code) VALUES('monitor','error',?,?)",
+                    ((NOW - timedelta(seconds=index)).isoformat(), f"error_{index}"),
+                )
+            connection.execute("INSERT INTO component_heartbeats(component,state,observed_at) VALUES('observer','starting',?)", (NOW.isoformat(),))
+            reference = connection.execute(
+                "SELECT component,state,observed_at,operation,error_code FROM component_heartbeats WHERE id<=9 OR id>=? ORDER BY id", (history_end,),
+            ).fetchall()
+            connection.commit()
+            connection.execute("PRAGMA query_only=ON")
+            vm_steps = 0
+            def bounded_work():
+                nonlocal vm_steps
+                vm_steps += 1000
+                return int(vm_steps > 10000)
+            connection.set_progress_handler(bounded_work, 1000)
+            rows = TraderStatusReader._heartbeat_events(connection)
+            connection.set_progress_handler(None, 0)
+        self.assertLessEqual(len(rows), 3 * 3 + 20)
+        self.assertEqual(_component_snapshot(rows, NOW), _component_snapshot(reference, NOW))
+        self.assertEqual(_recent_errors(rows), _recent_errors(reference))
+        self.assertEqual(len(_recent_errors(rows)), 20)
+        self.assertEqual(_recent_errors(rows)[0]["code"], "error_39")
+
+    def test_heartbeat_indexes_upgrade_existing_history_without_reader_writes(self) -> None:
+        repository = SQLiteHeartbeatRepository(self.database)
+        repository.initialize()
+        repository.record("worker", "error", observed_at=NOW, error_code="only_error")
+        indexes = ("idx_component_heartbeats_component_state_id", "idx_component_heartbeats_state_id")
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            for index in indexes:
+                connection.execute(f"DROP INDEX {index}")
+            connection.execute("PRAGMA query_only=ON")
+            rows = TraderStatusReader._heartbeat_events(connection)
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(_component_snapshot(rows, NOW)["worker"]["last_success_at"])
+        repository.initialize()
+        repository.initialize()
+        with sqlite3.connect(self.database) as connection:
+            names = {row[1] for row in connection.execute("PRAGMA index_list(component_heartbeats)")}
+            self.assertTrue(set(indexes).issubset(names))
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM component_heartbeats").fetchone()[0], 1)
 
     def tearDown(self) -> None:
         self.directory.cleanup()
@@ -208,6 +277,10 @@ class TraderStatusTests(unittest.TestCase):
         self.assertEqual(payload["execution"]["expiry"]["active_entry_count"], 2)
         self.assertEqual(payload["execution"]["expiry"]["expired_entry_count"], 1)
         self.assertEqual(len(payload["execution"]["reconciliation_required"]), 1)
+        self.assertIn(
+            "reconciliation_required",
+            {item["code"] for item in payload["operations"]["attention"]},
+        )
         active = payload["execution"]["active_intents"]
         self.assertEqual({item["symbol"] for item in active}, {"BTCUSDT", "ETHUSDT"})
         self.assertTrue(all("take_profit" in item for item in active))
@@ -244,10 +317,37 @@ class TraderStatusTests(unittest.TestCase):
         self.assertEqual(risk["active_reservations"], 2)
         self.assertEqual(risk["drawdown"]["current_loss_fraction"], "0.15")
         self.assertTrue(risk["drawdown"]["circuit_breaker_latched"])
+        self.assertEqual(payload["operations"]["status"], "blocked")
+        self.assertFalse(payload["operations"]["can_open_new_positions"])
+        self.assertIn("risk_mode_blocked", {item["code"] for item in payload["operations"]["attention"]})
         rendered = render_status(payload)
         self.assertIn("reserved risk: 15", rendered)
         self.assertIn("drawdown 15.00%", rendered)
         self.assertIn("circuit breaker YES", rendered)
+
+    def test_reads_persisted_account_position_metrics_without_exchange_access(self) -> None:
+        repository = SQLiteDemoExecutionRepository(self.database)
+        repository.initialize()
+        repository.record_account_snapshot(DemoStrategyAccountSnapshot(
+            equity=Decimal("1025"), wallet_balance=Decimal("1000"),
+            unrealised_pnl=Decimal("25"), available_balance=Decimal("900"),
+            position_initial_margin=Decimal("90"), order_initial_margin=Decimal("10"),
+            captured_at=NOW - timedelta(seconds=20), orders=(),
+            positions=(DemoAccountPosition(
+                "BTCUSDT", Direction.LONG, Decimal("2"), average_price=Decimal("100"),
+                mark_price=Decimal("105"), liquidation_price=Decimal("50"),
+                unrealised_pnl=Decimal("10"), leverage=Decimal("10"),
+                position_margin=Decimal("20"), take_profit=Decimal("108"),
+                stop_loss=Decimal("97"),
+            ),),
+        ))
+
+        payload = TraderStatusReader(self.database, clock=lambda: NOW).read()
+
+        self.assertEqual(payload["account"]["wallet_balance"], "1000")
+        self.assertEqual(payload["account"]["positions"][0]["mark_price"], "105")
+        self.assertEqual(payload["account"]["positions"][0]["liquidation_price"], "50")
+        self.assertEqual(payload["freshness"]["account_age_seconds"], 20)
 
     def test_performance_is_ledger_only_net_of_fee_without_double_counting(self) -> None:
         SQLiteExecutionForTest(self.database).initialize()

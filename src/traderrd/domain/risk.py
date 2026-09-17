@@ -259,6 +259,13 @@ class ConfirmPositionClosed:
 
 
 @dataclass(frozen=True, slots=True)
+class RequestPositionClose:
+    command_id: str
+    occurred_at: datetime
+    reservation_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class ManualRearm:
     command_id: str
     occurred_at: datetime
@@ -273,6 +280,7 @@ RiskCommand = (
     | ConfirmPendingFill
     | CancelPendingReservation
     | ConfirmPositionClosed
+    | RequestPositionClose
     | ManualRearm
 )
 
@@ -336,6 +344,15 @@ class PortfolioRiskEngine:
             decision, new_events = self._confirm_close(
                 state, command.reservation_id, actions
             )
+        elif isinstance(command, RequestPositionClose):
+            reservation = state.reservations.get(command.reservation_id)
+            if reservation is None or reservation.status not in {ReservationStatus.FILLED, ReservationStatus.CLOSE_REQUESTED}:
+                decision, new_events = self._rejected("reservation_not_filled"), []
+            else:
+                state.reservations[reservation.reservation_id] = replace(reservation, status=ReservationStatus.CLOSE_REQUESTED)
+                state.reversal_intents.pop(reservation.proposal.symbol, None)
+                decision = RiskDecision("accepted", "operator_close_requested", (self._close_action(reservation, "operator_requested"),))
+                new_events = [RiskEvent("operator_close_requested", reservation.reservation_id, "explicit_owned_close")]
         else:
             decision, new_events = self._manual_rearm(state, command)
         events.extend(new_events)

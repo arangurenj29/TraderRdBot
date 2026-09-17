@@ -13,6 +13,7 @@ from traderrd.domain.execution import (
     ExecutionIntentKind,
     ExecutionIntentState,
 )
+from traderrd.domain.bridge import DemoStrategyAccountSnapshot
 from traderrd.domain.models import Direction, canonical_decimal
 
 
@@ -81,6 +82,33 @@ class SQLiteDemoExecutionRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS demo_account_snapshots (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                    captured_at TEXT NOT NULL,
+                    equity TEXT NOT NULL,
+                    wallet_balance TEXT,
+                    unrealised_pnl TEXT,
+                    available_balance TEXT,
+                    position_initial_margin TEXT,
+                    order_initial_margin TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS demo_position_snapshots (
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    average_price TEXT,
+                    mark_price TEXT,
+                    liquidation_price TEXT,
+                    unrealised_pnl TEXT,
+                    leverage TEXT,
+                    position_margin TEXT,
+                    take_profit TEXT,
+                    stop_loss TEXT,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY(symbol, direction)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_demo_intent_state
                     ON demo_execution_intents(state);
                 CREATE INDEX IF NOT EXISTS idx_demo_intent_reservation
@@ -93,6 +121,55 @@ class SQLiteDemoExecutionRepository:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(demo_execution_intents)")}
             if "filled_quantity" not in columns:
                 connection.execute("ALTER TABLE demo_execution_intents ADD COLUMN filled_quantity TEXT")
+
+    def record_account_snapshot(self, snapshot: DemoStrategyAccountSnapshot) -> None:
+        """Atomically replace display-only account and position observations."""
+        optional = lambda value: canonical_decimal(value) if value is not None else None
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO demo_account_snapshots (
+                    singleton_id, captured_at, equity, wallet_balance,
+                    unrealised_pnl, available_balance, position_initial_margin,
+                    order_initial_margin
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    captured_at=excluded.captured_at, equity=excluded.equity,
+                    wallet_balance=excluded.wallet_balance,
+                    unrealised_pnl=excluded.unrealised_pnl,
+                    available_balance=excluded.available_balance,
+                    position_initial_margin=excluded.position_initial_margin,
+                    order_initial_margin=excluded.order_initial_margin
+                """,
+                (
+                    snapshot.captured_at.isoformat(), canonical_decimal(snapshot.equity),
+                    optional(snapshot.wallet_balance), optional(snapshot.unrealised_pnl),
+                    optional(snapshot.available_balance), optional(snapshot.position_initial_margin),
+                    optional(snapshot.order_initial_margin),
+                ),
+            )
+            connection.execute("DELETE FROM demo_position_snapshots")
+            connection.executemany(
+                """
+                INSERT INTO demo_position_snapshots (
+                    symbol, direction, quantity, average_price, mark_price,
+                    liquidation_price, unrealised_pnl, leverage, position_margin,
+                    take_profit, stop_loss, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        position.symbol, position.direction.value,
+                        canonical_decimal(position.quantity), optional(position.average_price),
+                        optional(position.mark_price), optional(position.liquidation_price),
+                        optional(position.unrealised_pnl), optional(position.leverage),
+                        optional(position.position_margin), optional(position.take_profit),
+                        optional(position.stop_loss), snapshot.captured_at.isoformat(),
+                    )
+                    for position in snapshot.positions
+                ],
+            )
 
     def record_fill_quantity(self, intent_id: str, quantity: Decimal) -> ExecutionIntent:
         with self._connection() as connection:
@@ -296,6 +373,16 @@ class SQLiteDemoExecutionRepository:
             ).fetchone()
             return self._from_row(row) if row else None
 
+    def find_close(self, reservation_id: str) -> ExecutionIntent | None:
+        with self._connection(readonly=True) as connection:
+            rows = connection.execute(
+                "SELECT * FROM demo_execution_intents WHERE risk_reservation_id=? AND kind='close_position'",
+                (reservation_id,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("Owned close intent is ambiguous")
+        return self._from_row(rows[0]) if rows else None
+
     def expirable_entries(self, now: datetime) -> list[ExecutionIntent]:
         with self._connection(readonly=True) as connection:
             rows = connection.execute(
@@ -333,8 +420,13 @@ class SQLiteDemoExecutionRepository:
     def mark_risk_sync_completed(self, intent_id: str) -> None:
         """Complete the durable terminal handoff only after all risk effects."""
         with self._connection() as connection:
-            self._event(connection, intent_id, "risk_sync_completed", "risk_effects_persisted",
-                        datetime.now(timezone.utc).isoformat())
+            connection.execute(
+                """INSERT INTO demo_execution_events(intent_id, event_type, detail, occurred_at)
+                SELECT ?, 'risk_sync_completed', 'risk_effects_persisted', ?
+                WHERE NOT EXISTS (SELECT 1 FROM demo_execution_events
+                    WHERE intent_id=? AND event_type='risk_sync_completed')""",
+                (intent_id, datetime.now(timezone.utc).isoformat(), intent_id),
+            )
 
     def planned_intents(self) -> list[ExecutionIntent]:
         """Return durable plans awaiting their first exchange submission."""
