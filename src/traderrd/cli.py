@@ -69,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
             "simulate-history",
             "risk-replay",
             "risk-report",
+            "demo-risk-epoch",
             "demo-preflight",
             "demo-bridge",
             "demo-execute",
@@ -165,6 +166,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Persist risk-replay decisions; never executes exchange actions",
     )
+    parser.add_argument("--epoch-id", help="Stable operator epoch ID (demo-risk-epoch only)")
+    parser.add_argument("--operator-reference", help="Auditable operator reference (demo-risk-epoch only)")
+    parser.add_argument(
+        "--apply-demo-risk-epoch", action="store_true",
+        help="Start a new Demo risk boundary only with fresh flat-account evidence",
+    )
     parser.add_argument(
         "--symbol",
         default=None,
@@ -252,6 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.command != "demo-risk-epoch" and (
+        args.epoch_id is not None or args.operator_reference is not None or args.apply_demo_risk_epoch
+    ):
+        parser.error("epoch options require demo-risk-epoch")
     if args.close_owned_position and (args.command != "demo-reconcile" or not args.apply_demo_reconciliation):
         parser.error("--close-owned-position requires demo-reconcile --apply-demo-reconciliation")
     retired_testnet_commands = {
@@ -309,6 +320,7 @@ def main() -> int:
         "simulate-history",
         "risk-replay",
         "risk-report",
+        "demo-risk-epoch",
         "demo-bridge",
         "demo-execute",
         "demo-reconcile",
@@ -358,6 +370,22 @@ def main() -> int:
             args.commands_file,
             database_path,
             args.apply_risk_state,
+        )
+    if args.command == "demo-risk-epoch":
+        if (args.risk_command_id is not None or args.submit_demo or args.intent_id is not None
+                or args.apply_demo_reconciliation or args.close_owned_position
+                or args.apply_demo_monitor or args.apply_demo_worker or args.watch
+                or args.interval_seconds != 30.0 or args.message_id is not None
+                or args.source_sender_id is not None or args.persist_risk
+                or args.estimated_cost_rate != Decimal("0.001")):
+            parser.error("demo-risk-epoch does not accept other Demo mutation options")
+        if args.apply_demo_risk_epoch and (not args.epoch_id or not args.operator_reference):
+            parser.error("applied Demo epoch requires --epoch-id and --operator-reference")
+        from traderrd.demo_risk_epoch import run_demo_risk_epoch
+
+        return run_demo_risk_epoch(
+            _resolve_database_path(args.database_path), args.epoch_id, args.operator_reference,
+            args.apply_demo_risk_epoch, args.env_file, args.symbol or "BTCUSDT",
         )
     demo_commands = {
         "demo-preflight",

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -17,7 +17,9 @@ from traderrd.application.risk_engine import (
     state_from_dict,
     state_to_dict,
 )
-from traderrd.domain.risk import PortfolioRiskEngine, PortfolioState, RiskCommand
+from traderrd.domain.risk import (
+    PortfolioRiskEngine, PortfolioState, RiskCommand, StartDemoRiskEpoch,
+)
 
 
 class IdempotencyConflict(ValueError):
@@ -73,6 +75,74 @@ class SQLiteRiskStateRepository:
         command: RiskCommand,
         engine: PortfolioRiskEngine,
     ) -> RiskExecutionResult:
+        if isinstance(command, StartDemoRiskEpoch):
+            raise ValueError("Demo epochs require the dedicated operator action")
+        return self._execute(command, engine)
+
+    def start_demo_epoch(self, command: StartDemoRiskEpoch) -> RiskExecutionResult:
+        """Audit a proven Demo boundary with local guards in the same transaction."""
+        if not isinstance(command, StartDemoRiskEpoch):
+            raise ValueError("Dedicated Demo epoch input is required")
+        return self._execute(command, PortfolioRiskEngine(), demo_epoch=True)
+
+    def check_demo_epoch_ready(self) -> PortfolioState:
+        with self._connection(readonly=True) as connection:
+            state = self._load_state(connection)
+            self._check_epoch_idle(connection, state)
+            return state
+
+    @staticmethod
+    def _check_epoch_idle(connection: sqlite3.Connection, state: PortfolioState | None) -> None:
+        if state is None:
+            raise ValueError("Demo epoch requires an initialized risk engine")
+        if state.mode.value == "killed":
+            raise ValueError("Killed risk engine requires ManualRearm")
+        if state.active_reservations or state.reversal_intents:
+            raise ValueError("Demo epoch requires no active reservations or reversals")
+        # Missing schema is unknown, not evidence of an empty execution ledger.
+        rows = connection.execute(
+            "SELECT intent_id, risk_reservation_id, kind, state FROM demo_execution_intents"
+        ).fetchall()
+        unresolved = connection.execute(
+            "SELECT 1 FROM demo_performance_outcomes WHERE status != 'attributed' LIMIT 1"
+        ).fetchone()
+        if unresolved:
+            raise ValueError("Demo epoch requires resolved performance outcomes")
+        for row in rows:
+            reservation = state.reservations.get(row["risk_reservation_id"])
+            if reservation is None or row["kind"] not in {
+                "entry", "cancel_entry", "close_position", "set_trading_stop",
+            }:
+                raise ValueError("Demo epoch found unmanaged execution history")
+            if row["state"] not in {"cancelled", "rejected", "close_confirmed", "position_closed"}:
+                raise ValueError("Demo epoch requires no pending or unresolved execution intents")
+            if row["state"] == "close_confirmed" and (
+                row["kind"] != "close_position" or reservation.status.value != "closed"
+            ):
+                raise ValueError("Demo epoch found contradictory owned-close evidence")
+            if row["state"] == "position_closed":
+                attributed = connection.execute(
+                    "SELECT 1 FROM demo_performance_outcomes WHERE entry_intent_id=? "
+                    "AND risk_reservation_id=? AND status='attributed'",
+                    (row["intent_id"], row["risk_reservation_id"]),
+                ).fetchone()
+                if row["kind"] != "entry" or reservation.status.value != "closed" or not attributed:
+                    raise ValueError("Demo epoch found contradictory closed-position evidence")
+            if (
+                row["state"] == "close_confirmed"
+                or row["kind"] in {"entry", "cancel_entry"}
+                and row["state"] in {"cancelled", "rejected"}
+            ):
+                synced = connection.execute(
+                    "SELECT 1 FROM demo_execution_events WHERE intent_id=? AND event_type='risk_sync_completed'",
+                    (row["intent_id"],),
+                ).fetchone()
+                if not synced:
+                    raise ValueError("Demo epoch requires completed risk reconciliation")
+
+    def _execute(
+        self, command: RiskCommand, engine: PortfolioRiskEngine, *, demo_epoch: bool = False,
+    ) -> RiskExecutionResult:
         input_digest = command_digest(command)
         input_payload = command_to_dict(command)
         with self._connection() as connection:
@@ -100,6 +170,11 @@ class SQLiteRiskStateRepository:
                 )
 
             state = self._load_state(connection)
+            if demo_epoch:
+                self._check_epoch_idle(connection, state)
+                age = datetime.now(timezone.utc) - command.captured_at
+                if not timedelta(0) <= age <= timedelta(seconds=10):
+                    raise ValueError("Demo epoch evidence expired before the audit transaction")
             transition = engine.process(state, command)
             current = connection.execute(
                 "SELECT revision FROM risk_engine_state WHERE singleton_id = 1"

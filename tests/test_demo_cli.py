@@ -39,6 +39,22 @@ UTC = timezone.utc
 
 
 class DemoCliSafetyTests(unittest.TestCase):
+    def test_cli_routes_dedicated_demo_epoch_with_explicit_identity(self) -> None:
+        with (patch("sys.argv", ["traderrd", "demo-risk-epoch", "--epoch-id", "epoch-1",
+                                  "--operator-reference", "operator", "--apply-demo-risk-epoch",
+                                  "--database-path", "/tmp/demo.sqlite3"]),
+              patch("traderrd.demo_risk_epoch.run_demo_risk_epoch", return_value=0) as run):
+            self.assertEqual(main(), 0)
+        run.assert_called_once_with("/tmp/demo.sqlite3", "epoch-1", "operator", True, ".env", "BTCUSDT")
+
+    def test_cli_rejects_epoch_options_on_other_commands_and_unattributed_apply(self) -> None:
+        for args in (["status", "--epoch-id", "epoch"],
+                     ["demo-risk-epoch", "--apply-demo-risk-epoch"],
+                     ["demo-risk-epoch", "--watch"]):
+            with self.subTest(args=args), patch("sys.argv", ["traderrd", *args]), patch("sys.stderr", new_callable=StringIO):
+                with self.assertRaises(SystemExit):
+                    main()
+
     def test_applied_worker_holds_shared_lock_until_exception_and_then_releases(self) -> None:
         from traderrd.demo_cli import run_demo_worker
         from traderrd.demo_runtime import DemoRuntimeAlreadyRunningError

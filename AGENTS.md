@@ -191,3 +191,14 @@ lock holder may subsequently acquire the supervisor lock. Close confirmation
 requires unique execution IDs, exact owned
 order/link, symbol, closing side and full cumulative filled quantity; flatness
 alone cannot release risk.
+
+`demo-risk-epoch` is an explicit offline Demo-only boundary, not a live reset
+through `risk-replay`. Before applying it, stop supervision and every applied
+trading command and verify a SQLite backup. Its supervisor-then-exclusive-operation
+locks precede credentials; fresh complete GET-only Demo equity, zero positions,
+zero orders and margins, and atomic local no-reservation/no-reconciliation proof
+are mandatory. Preserve history and audit old/new high watermark and period
+anchors. Missing/stale/contradictory evidence fails closed. Killed state and fresh
+equity at the old 15% drawdown boundary cannot use this action; `ManualRearm`
+remains the killed recovery path. Idempotent retries reuse the original epoch ID,
+operator reference, symbol, and immutable audited evidence, never refreshed inputs.

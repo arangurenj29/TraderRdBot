@@ -1190,3 +1190,45 @@ lock holder may subsequently acquire the supervisor lock. Close confirmation
 requires unique execution IDs, exact owned
 order/link, symbol, closing side and full cumulative filled quantity; flatness
 alone cannot release risk.
+
+### Start a new Demo risk epoch
+
+A new epoch resets the risk high watermark and daily/weekly equity anchors to
+fresh `walletBalance + unrealisedPnl`. It preserves reservations, closed-trade
+performance, and the complete command/event audit history. It is not a real-account
+mode, a kill-switch bypass, or an automatic response to rejected signals.
+
+1. Stop `demo-run` and all individually launched applied trading commands.
+2. Take and verify a SQLite backup with `scripts/sqlite_snapshot.py`.
+3. Inspect local readiness without credentials, network requests, or writes:
+   `traderrd demo-risk-epoch --database-path /var/lib/traderrd/traderrd.sqlite3`.
+   This does **not** prove exchange flatness.
+4. Explicitly start the boundary with a unique stable epoch ID and operator reference:
+
+   ```bash
+   traderrd demo-risk-epoch --database-path /var/lib/traderrd/traderrd.sqlite3 \
+     --env-file .env.server --epoch-id demo-restart-2026-10-09 \
+     --operator-reference operator-approved-restart --apply-demo-risk-epoch
+   ```
+
+The applied action acquires the supervisor lock, then the exclusive operation
+lock, before loading dedicated Demo credentials. It obtains a complete, paginated,
+GET-only account snapshot from the fixed Demo endpoint; `--symbol` defaults to
+`BTCUSDT` only for instrument validation. Positions and open orders are checked
+across the strategy's entire linear USDT account, not just that symbol. Evidence
+must be at most ten seconds old, internally consistent, flat, and have zero
+unrealised P&L and position/order initial margin. Stale, partial, unmanaged, or
+contradictory evidence rejects the action.
+
+The audit transaction rechecks that no active reservations, staged reversals,
+pending intents, incomplete risk handoffs, or unresolved performance outcomes
+remain. Missing execution schema is unknown, not an empty ledger. A killed engine,
+or fresh equity already at the existing 15% drawdown boundary, cannot start this
+epoch; killed recovery remains `ManualRearm` only. The normal fixed risk limits
+apply unchanged after a successful boundary.
+
+Retry an interrupted action using exactly the same epoch ID, operator reference,
+and symbol. A committed retry reports its existing result without fetching new
+equity or moving the boundary again; a changed identity is rejected. A new epoch
+requires a new ID and fresh evidence. `risk-replay --apply-risk-state` cannot apply
+this operation. Restart supervision only after success and inspect `risk-report`.

@@ -35,6 +35,19 @@ COMMANDS = [
 
 
 class RiskCliTests(unittest.TestCase):
+    def test_live_epoch_replay_is_refused_before_initializing_database(self) -> None:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        epoch = dict(type="start_demo_risk_epoch", command_id="demo-risk-epoch:epoch",
+                     occurred_at=now, captured_at=now, equity="860", wallet_balance="860",
+                     unrealised_pnl="0", operator_reference="operator",
+                     previous_epoch_id="initial", evidence_symbol="BTCUSDT")
+        self.commands_path.write_text(json.dumps(epoch) + "\n", encoding="utf-8")
+        with patch("sys.stdout", new_callable=StringIO) as output:
+            self.assertEqual(run_risk_replay(self.commands_path, self.database_path, True), 1)
+        self.assertFalse(self.database_path.exists())
+        self.assertIn("never risk-replay", output.getvalue())
+
     def test_applied_replay_refuses_exclusive_operation_without_database_writes(self) -> None:
         with (
             _demo_operation_lock(self.database_path, exclusive=True),

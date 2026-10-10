@@ -14,7 +14,7 @@ from traderrd.application.risk_engine import (
 )
 from traderrd.demo_runtime import _demo_operation_lock, DemoRuntimeAlreadyRunningError
 from traderrd.domain.models import canonical_decimal
-from traderrd.domain.risk import ReservationStatus
+from traderrd.domain.risk import ReservationStatus, StartDemoRiskEpoch
 from traderrd.infrastructure.risk_repository import SQLiteRiskStateRepository
 
 
@@ -38,6 +38,8 @@ def _run_risk_replay(
 ) -> int:
     try:
         commands = _read_commands(Path(commands_file))
+        if apply_state and any(isinstance(command, StartDemoRiskEpoch) for command in commands):
+            raise ValueError("Live Demo epochs require demo-risk-epoch, never risk-replay")
         if apply_state:
             repository = SQLiteRiskStateRepository(database_path)
             repository.initialize()

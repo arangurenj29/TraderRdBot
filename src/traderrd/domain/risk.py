@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+import json
 from zoneinfo import ZoneInfo
 
 from traderrd.domain.models import Direction, canonical_decimal
@@ -192,6 +193,7 @@ class PortfolioState:
     weekly_halted: bool = False
     reservations: dict[str, RiskReservation] = field(default_factory=dict)
     reversal_intents: dict[str, ReversalIntent] = field(default_factory=dict)
+    risk_epoch_id: str = "initial"
 
     @property
     def active_reservations(self) -> list[RiskReservation]:
@@ -273,6 +275,19 @@ class ManualRearm:
     operator_reference: str
 
 
+@dataclass(frozen=True, slots=True)
+class StartDemoRiskEpoch:
+    command_id: str
+    occurred_at: datetime
+    equity: Decimal
+    operator_reference: str
+    previous_epoch_id: str
+    captured_at: datetime
+    wallet_balance: Decimal
+    unrealised_pnl: Decimal
+    evidence_symbol: str
+
+
 RiskCommand = (
     InitializeRiskEngine
     | ApplyEquitySnapshot
@@ -282,6 +297,7 @@ RiskCommand = (
     | ConfirmPositionClosed
     | RequestPositionClose
     | ManualRearm
+    | StartDemoRiskEpoch
 )
 
 
@@ -305,6 +321,9 @@ class PortfolioRiskEngine:
             raise ValueError("Risk engine must be initialized first")
         if command.occurred_at < state.as_of:
             raise ValueError("Risk commands must be chronological")
+
+        if isinstance(command, StartDemoRiskEpoch):
+            return self._start_demo_epoch(state, command)
 
         actions, events = self._advance_time(state, command.occurred_at)
         if isinstance(command, ApplyEquitySnapshot):
@@ -714,6 +733,74 @@ class PortfolioRiskEngine:
         # Cancellation/closure succeeded even when the opposite proposal no
         # longer passes admission. Never strand the completed exchange handoff.
         return RiskDecision("accepted", reason, tuple(actions)), events
+
+    def _start_demo_epoch(
+        self, state: PortfolioState, command: StartDemoRiskEpoch,
+    ) -> RiskTransition:
+        if state.mode is EngineMode.KILLED:
+            raise ValueError("Killed risk engine requires ManualRearm")
+        if state.active_reservations or state.reversal_intents:
+            raise ValueError("Demo epoch requires no active reservations or reversals")
+        if (
+            not command.operator_reference.strip()
+            or command.previous_epoch_id != state.risk_epoch_id
+        ):
+            raise ValueError("Demo epoch operator or previous boundary is invalid")
+        if command.captured_at.tzinfo is None:
+            raise ValueError("Demo epoch evidence must be fresh")
+        age = command.occurred_at - command.captured_at
+        if not timedelta(0) <= age <= timedelta(seconds=10):
+            raise ValueError("Demo epoch evidence must be fresh")
+        if (
+            not command.equity.is_finite() or command.equity <= 0
+            or not command.wallet_balance.is_finite() or command.wallet_balance <= 0
+            or not command.unrealised_pnl.is_finite() or command.unrealised_pnl != 0
+            or command.equity != command.wallet_balance + command.unrealised_pnl
+        ):
+            raise ValueError("Demo epoch equity evidence is contradictory")
+        if _loss_fraction(state.high_watermark, command.equity) >= state.policy.max_drawdown_fraction:
+            raise ValueError("Fresh equity reaches the kill boundary; ManualRearm is required")
+
+        def boundary() -> dict[str, str | bool]:
+            return {
+                "epoch_id": state.risk_epoch_id,
+                "mode": state.mode.value,
+                "equity": canonical_decimal(state.equity),
+                "high_watermark": canonical_decimal(state.high_watermark),
+                "daily_anchor": state.daily_anchor.isoformat(),
+                "daily_start_equity": canonical_decimal(state.daily_start_equity),
+                "weekly_anchor": state.weekly_anchor.isoformat(),
+                "weekly_start_equity": canonical_decimal(state.weekly_start_equity),
+                "daily_halted": state.daily_halted,
+                "weekly_halted": state.weekly_halted,
+            }
+
+        old = boundary()
+        local = command.occurred_at.astimezone(LIMA).date()
+        state.risk_epoch_id = command.command_id
+        state.as_of = command.occurred_at
+        state.mode = EngineMode.ACTIVE
+        state.equity = state.high_watermark = command.equity
+        state.daily_anchor = local
+        state.weekly_anchor = _week_start(local)
+        state.daily_start_equity = state.weekly_start_equity = command.equity
+        state.daily_halted = state.weekly_halted = False
+        detail = json.dumps(
+            {
+                "old": old,
+                "new": boundary(),
+                "operator_reference": command.operator_reference,
+                "evidence_source": "bybit_demo_get",
+                "captured_at": command.captured_at.isoformat(),
+                "position_count": 0,
+                "open_order_count": 0,
+            },
+            sort_keys=True, separators=(",", ":"),
+        )
+        return RiskTransition(
+            state, RiskDecision("accepted", "demo_risk_epoch_started"),
+            (RiskEvent("demo_risk_epoch_started", command.command_id, detail),),
+        )
 
     def _manual_rearm(
         self, state: PortfolioState, command: ManualRearm

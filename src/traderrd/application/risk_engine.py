@@ -16,6 +16,7 @@ from traderrd.domain.risk import (
     EngineMode,
     InitializeRiskEngine,
     ManualRearm,
+    StartDemoRiskEpoch,
     RequestPositionClose,
     PortfolioRiskEngine,
     PortfolioState,
@@ -152,10 +153,29 @@ def command_from_dict(payload: dict[str, Any]) -> RiskCommand:
             equity=_decimal(payload, "equity"),
             operator_reference=_required_text(payload, "operator_reference"),
         )
+    if command_type == "start_demo_risk_epoch":
+        return StartDemoRiskEpoch(
+            **common, equity=_decimal(payload, "equity"),
+            operator_reference=_required_text(payload, "operator_reference"),
+            previous_epoch_id=_required_text(payload, "previous_epoch_id"),
+            captured_at=_datetime(payload, "captured_at"),
+            wallet_balance=_decimal(payload, "wallet_balance"),
+            unrealised_pnl=_decimal(payload, "unrealised_pnl"),
+            evidence_symbol=_required_text(payload, "evidence_symbol"),
+        )
     raise ValueError(f"Unsupported risk command type: {command_type}")
 
 
 def command_to_dict(command: RiskCommand) -> dict[str, Any]:
+    if isinstance(command, StartDemoRiskEpoch):
+        return _simple_command(
+            command, "start_demo_risk_epoch", equity=command.equity,
+            operator_reference=command.operator_reference,
+            previous_epoch_id=command.previous_epoch_id,
+            captured_at=command.captured_at.isoformat(),
+            wallet_balance=command.wallet_balance, unrealised_pnl=command.unrealised_pnl,
+            evidence_symbol=command.evidence_symbol,
+        )
     if isinstance(command, InitializeRiskEngine):
         return {
             "type": "initialize",
@@ -245,6 +265,7 @@ def state_to_dict(state: PortfolioState) -> dict[str, Any]:
             "estimated_cost_rate": canonical_decimal(policy.estimated_cost_rate),
         },
         "mode": state.mode.value,
+        "risk_epoch_id": state.risk_epoch_id,
         "as_of": state.as_of.isoformat(),
         "equity": canonical_decimal(state.equity),
         "high_watermark": canonical_decimal(state.high_watermark),
@@ -289,6 +310,7 @@ def state_from_dict(payload: dict[str, Any]) -> PortfolioState:
     return PortfolioState(
         policy=policy,
         mode=EngineMode(payload["mode"]),
+        risk_epoch_id=str(payload.get("risk_epoch_id", "initial")),
         as_of=datetime.fromisoformat(payload["as_of"]),
         equity=Decimal(payload["equity"]),
         high_watermark=Decimal(payload["high_watermark"]),
