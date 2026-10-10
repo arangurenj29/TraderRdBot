@@ -60,3 +60,12 @@ Parent integrates/publishes the verified feature commits into `dev`, then `main`
 - Rollback source /tmp/traderrd-epoch-20261009/previous-source.tar.gz and image tags traderrd:epoch-rollback-running-20261009 / traderrd:epoch-rollback-tag-20261009 preserved.
 - Aggregate account snapshot remains stale; epoch audit contains fresh evidence.
 - Work-unit commits and local verification are complete. Parent integration/publishing of `dev` then `main` remains pending; no PR or force-push is authorized by this worker assignment. Engram mirror pending host registration.
+
+## Git synchronization evidence
+- User explicitly authorized configured Git/GitHub authentication for origin arangurenj29/TraderRdBot and normal publication through dev then main, with no force-push.
+- Fresh origin references matched the local baseline 9a47c44 before integration.
+- T1 commit 5f28b0f4562ae33e7a8223814d0c02f882431378 and T2 commit 44245abeca10cfaac1d5fad57376950f34863c56 were integrated with documentation commit 3a7820c9bcb535025e75ed77fe9adb5eccece2fa.
+- dev was fast-forwarded and pushed successfully, followed by main fast-forward and successful push. No history rewrite, new source mutation, server restart, or repeated epoch action occurred during Git synchronization.
+- Runtime files remained byte-identical to the deployed verified version. Verification remains T1 286 full tests and T2 307 full tests; the final delivery update is passive documentation checked by readback and diff --check.
+- Engram mirror remains unavailable until the host registers an authoritative session identity.
+- Next step: observe natural new-signal admission; no implementation or Git integration remains pending after this documentation update is published.
