@@ -16,6 +16,7 @@ from typing import Callable, TextIO
 
 
 _LOCK_NAME = ".traderrd-demo-run.lock"
+_OPERATION_LOCK_NAME = ".traderrd-demo-operation.lock"
 _SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
@@ -62,7 +63,10 @@ class DemoRuntimeSupervisor:
     def run(self) -> int:
         if self._interval_seconds <= 0:
             raise ValueError("Demo runtime interval must be positive")
-        with _exclusive_runtime_lock(Path(self._database_path).parent / _LOCK_NAME):
+        with (
+            _exclusive_runtime_lock(Path(self._database_path).resolve().parent / _LOCK_NAME),
+            _demo_operation_lock(self._database_path),
+        ):
             self._write("TraderRd Demo runtime starting (Demo Trading only; mainnet disabled)")
             try:
                 self._start_dashboard_if_supported()
@@ -228,6 +232,44 @@ class DemoRuntimeSupervisor:
             self._dashboard.log(f"[runtime] {message}")
         else:
             print(message, file=self._output, flush=True)
+
+
+class _demo_operation_lock:
+    """Exclude offline operator actions from all applied trading commands.
+
+    Shared owners may coexist. Acquire the supervisor lock first whenever
+    both locks are needed; never acquire it from inside an operation lock.
+    """
+
+    def __init__(self, database_path: str | Path, *, exclusive: bool = False) -> None:
+        self._path = Path(database_path).resolve().parent / _OPERATION_LOCK_NAME
+        self._exclusive = exclusive
+        self._file: TextIO | None = None
+
+    def __enter__(self) -> "_demo_operation_lock":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self._path.open("a+", encoding="utf-8")
+        operation = fcntl.LOCK_EX if self._exclusive else fcntl.LOCK_SH
+        try:
+            fcntl.flock(self._file.fileno(), operation | fcntl.LOCK_NB)
+        except BaseException as exc:
+            self._file.close()
+            self._file = None
+            if isinstance(exc, BlockingIOError):
+                raise DemoRuntimeAlreadyRunningError(
+                    "A conflicting Demo trading operation is active. "
+                    "Stop applied commands before exclusive operator recovery."
+                ) from exc
+            raise
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        if self._file is not None:
+            try:
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._file.close()
+                self._file = None
 
 
 class _exclusive_runtime_lock:

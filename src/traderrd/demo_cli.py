@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import sqlite3
@@ -18,7 +19,13 @@ from traderrd.application.demo_worker import (
     DemoSignalWorker,
     DemoWorkerError,
 )
-from traderrd.demo_runtime import run_demo_runtime, _exclusive_runtime_lock, _LOCK_NAME, DemoRuntimeAlreadyRunningError
+from traderrd.demo_runtime import (
+    DemoRuntimeAlreadyRunningError,
+    _LOCK_NAME,
+    _demo_operation_lock,
+    _exclusive_runtime_lock,
+    run_demo_runtime,
+)
 from traderrd.config import load_dotenv
 from traderrd.domain.execution import ExecutionIntentKind, ExecutionIntentState
 from traderrd.infrastructure.bybit_demo import (
@@ -76,6 +83,23 @@ def run_demo_preflight(symbol: str, env_path: str | Path = ".env") -> int:
 
 
 def run_demo_execute(
+    database_path: str | Path,
+    symbol: str,
+    risk_command_id: str | None,
+    submit_demo: bool,
+    env_path: str | Path = ".env",
+) -> int:
+    try:
+        with _demo_operation_lock(database_path) if submit_demo else nullcontext():
+            return _run_demo_execute(
+                database_path, symbol, risk_command_id, submit_demo, env_path
+            )
+    except (DemoRuntimeAlreadyRunningError, OSError) as exc:
+        print(f"Bybit Demo Trading execute failed: {exc}")
+        return 1
+
+
+def _run_demo_execute(
     database_path: str | Path,
     symbol: str,
     risk_command_id: str | None,
@@ -141,14 +165,26 @@ def run_demo_reconcile(
 ) -> int:
     if close_owned_position and apply_reconciliation:
         try:
-            with _exclusive_runtime_lock(Path(database_path).resolve().parent / _LOCK_NAME):
-                return _run_demo_reconcile(database_path, intent_id, apply_reconciliation,
-                                           env_path, close_owned_position=True)
+            with (
+                _exclusive_runtime_lock(Path(database_path).resolve().parent / _LOCK_NAME),
+                _demo_operation_lock(database_path, exclusive=True),
+            ):
+                return _run_demo_reconcile(
+                    database_path, intent_id, apply_reconciliation,
+                    env_path, close_owned_position=True,
+                )
         except (DemoRuntimeAlreadyRunningError, OSError) as exc:
             print(f"Bybit Demo Trading reconciliation failed: {exc}")
             return 1
-    return _run_demo_reconcile(database_path, intent_id, apply_reconciliation, env_path,
-                               close_owned_position=close_owned_position)
+    try:
+        with _demo_operation_lock(database_path) if apply_reconciliation else nullcontext():
+            return _run_demo_reconcile(
+                database_path, intent_id, apply_reconciliation, env_path,
+                close_owned_position=close_owned_position,
+            )
+    except (DemoRuntimeAlreadyRunningError, OSError) as exc:
+        print(f"Bybit Demo Trading reconciliation failed: {exc}")
+        return 1
 
 
 def _run_demo_reconcile(
@@ -199,6 +235,23 @@ def _run_demo_reconcile(
 
 
 def run_demo_monitor(
+    database_path: str | Path,
+    apply_monitor: bool,
+    watch: bool,
+    interval_seconds: float,
+    env_path: str | Path = ".env",
+) -> int:
+    try:
+        with _demo_operation_lock(database_path) if apply_monitor else nullcontext():
+            return _run_demo_monitor(
+                database_path, apply_monitor, watch, interval_seconds, env_path
+            )
+    except (DemoRuntimeAlreadyRunningError, OSError) as exc:
+        print(f"Bybit Demo Trading monitor failed: {exc}")
+        return 1
+
+
+def _run_demo_monitor(
     database_path: str | Path,
     apply_monitor: bool,
     watch: bool,
@@ -277,6 +330,23 @@ def run_demo_monitor(
 
 
 def run_demo_worker(
+    database_path: str | Path,
+    apply_worker: bool,
+    watch: bool,
+    interval_seconds: float,
+    env_path: str | Path = ".env",
+) -> int:
+    try:
+        with _demo_operation_lock(database_path) if apply_worker else nullcontext():
+            return _run_demo_worker(
+                database_path, apply_worker, watch, interval_seconds, env_path
+            )
+    except (DemoRuntimeAlreadyRunningError, OSError) as exc:
+        print(f"Bybit Demo Trading worker failed: {exc}")
+        return 1
+
+
+def _run_demo_worker(
     database_path: str | Path,
     apply_worker: bool,
     watch: bool,

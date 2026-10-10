@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from decimal import Decimal
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import sqlite3
 
 from traderrd.application.demo_bridge import DemoBridgeError, DemoSignalBridgeService
 from traderrd.demo_cli import load_demo_client
+from traderrd.demo_runtime import _demo_operation_lock, DemoRuntimeAlreadyRunningError
 from traderrd.infrastructure.bridge_repository import SQLiteDemoBridgeRepository
 from traderrd.infrastructure.bybit_demo import (
     BybitDemoAccountSnapshotProvider,
@@ -19,6 +21,25 @@ from traderrd.infrastructure.risk_repository import SQLiteRiskStateRepository
 
 
 def run_demo_bridge(
+    database_path: str | Path,
+    source_message_id: int,
+    source_sender_id: int,
+    persist_risk: bool,
+    estimated_cost_rate: Decimal,
+    env_path: str | Path = ".env",
+) -> int:
+    try:
+        with _demo_operation_lock(database_path) if persist_risk else nullcontext():
+            return _run_demo_bridge(
+                database_path, source_message_id, source_sender_id,
+                persist_risk, estimated_cost_rate, env_path,
+            )
+    except (DemoRuntimeAlreadyRunningError, OSError) as exc:
+        print(f"Bybit Demo supervised bridge failed: {exc}")
+        return 1
+
+
+def _run_demo_bridge(
     database_path: str | Path,
     source_message_id: int,
     source_sender_id: int,

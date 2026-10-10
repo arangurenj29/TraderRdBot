@@ -32,12 +32,82 @@ from traderrd.demo_cli import (
     run_demo_preflight,
 )
 from traderrd.demo_bridge_cli import _configured_sender_id
+from traderrd.demo_runtime import _demo_operation_lock, _exclusive_runtime_lock, _LOCK_NAME
 
 
 UTC = timezone.utc
 
 
 class DemoCliSafetyTests(unittest.TestCase):
+    def test_applied_worker_holds_shared_lock_until_exception_and_then_releases(self) -> None:
+        from traderrd.demo_cli import run_demo_worker
+        from traderrd.demo_runtime import DemoRuntimeAlreadyRunningError
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+
+            def interrupted(*args):
+                # Another normal component is allowed, but offline recovery is not.
+                with _demo_operation_lock(database):
+                    with self.assertRaises(DemoRuntimeAlreadyRunningError):
+                        with _demo_operation_lock(database, exclusive=True):
+                            pass
+                raise ValueError("interrupted")
+
+            with patch("traderrd.demo_cli._run_demo_worker", side_effect=interrupted):
+                with self.assertRaisesRegex(ValueError, "interrupted"):
+                    run_demo_worker(database, True, False, 30)
+            with _demo_operation_lock(database, exclusive=True):
+                pass
+
+    def test_dry_entrypoints_do_not_create_operation_lock(self) -> None:
+        from traderrd.demo_cli import run_demo_reconcile, run_demo_worker, run_demo_monitor
+        from traderrd.demo_runtime import _OPERATION_LOCK_NAME
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+            with (
+                patch("traderrd.demo_cli._run_demo_execute", return_value=0),
+                patch("traderrd.demo_cli._run_demo_reconcile", return_value=0),
+                patch("traderrd.demo_cli._run_demo_worker", return_value=0),
+                patch("traderrd.demo_cli._run_demo_monitor", return_value=0),
+            ):
+                self.assertEqual(run_demo_execute(database, "BTCUSDT", None, False), 0)
+                self.assertEqual(run_demo_reconcile(database, "entry-id", False), 0)
+                self.assertEqual(run_demo_worker(database, False, False, 30), 0)
+                self.assertEqual(run_demo_monitor(database, False, False, 30), 0)
+            self.assertFalse((database.parent / _OPERATION_LOCK_NAME).exists())
+
+    def test_applied_entrypoints_refuse_exclusive_operation_before_credentials(self) -> None:
+        from traderrd.demo_cli import run_demo_reconcile, run_demo_worker, run_demo_monitor
+        from traderrd.demo_bridge_cli import run_demo_bridge
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+            actions = (
+                lambda: run_demo_execute(database, "BTCUSDT", "risk-id", True),
+                lambda: run_demo_reconcile(database, "entry-id", True),
+                lambda: run_demo_reconcile(database, "entry-id", True, close_owned_position=True),
+                lambda: run_demo_worker(database, True, False, 30),
+                lambda: run_demo_monitor(database, True, False, 30),
+                lambda: run_demo_bridge(database, 1, 8003985182, True, Decimal("0.001")),
+            )
+            with (
+                _demo_operation_lock(database, exclusive=True),
+                patch("traderrd.demo_cli.load_demo_client") as load,
+                patch("traderrd.demo_bridge_cli.load_demo_client") as bridge_load,
+                patch("sys.stdout", new_callable=StringIO),
+            ):
+                for index, action in enumerate(actions):
+                    with self.subTest(action=index):
+                        self.assertEqual(action(), 1)
+                        self.assertFalse(database.exists())
+                        load.assert_not_called()
+                        bridge_load.assert_not_called()
+            # Failed owned-close acquisition must also release the supervisor lock.
+            with _exclusive_runtime_lock(database.parent / _LOCK_NAME):
+                pass
+
     def test_bridge_sender_guard_requires_confirmed_numeric_configuration(self) -> None:
         with patch.dict(
             "os.environ", {"TELEGRAM_EXPECTED_SENDER_ID": "778899"}, clear=True

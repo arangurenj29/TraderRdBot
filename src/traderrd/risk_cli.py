@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import nullcontext
 from decimal import DecimalException
 import json
 from pathlib import Path
@@ -11,12 +12,26 @@ from traderrd.application.risk_engine import (
     RiskEngineService,
     command_from_dict,
 )
+from traderrd.demo_runtime import _demo_operation_lock, DemoRuntimeAlreadyRunningError
 from traderrd.domain.models import canonical_decimal
 from traderrd.domain.risk import ReservationStatus
 from traderrd.infrastructure.risk_repository import SQLiteRiskStateRepository
 
 
 def run_risk_replay(
+    commands_file: str | Path,
+    database_path: str | Path,
+    apply_state: bool,
+) -> int:
+    try:
+        with _demo_operation_lock(database_path) if apply_state else nullcontext():
+            return _run_risk_replay(commands_file, database_path, apply_state)
+    except (DemoRuntimeAlreadyRunningError, OSError) as exc:
+        print(f"Risk replay error: {exc}")
+        return 1
+
+
+def _run_risk_replay(
     commands_file: str | Path,
     database_path: str | Path,
     apply_state: bool,

@@ -175,9 +175,19 @@ order, cursor, risk, source-isolation, and restart/idempotency change.
 - Server prerequisites must link to Docker's official Ubuntu Engine and Compose
   installation documentation; never add Docker installation scripts to this repo.
 
-The explicit applied owned-close command acquires the same operation lock as
-`demo-run` before loading credentials and holds it until reconciliation returns.
-Stop individually launched worker/monitor processes too: they do not own this
-supervisor lock. Close confirmation requires unique execution IDs, exact owned
+Applied Demo trading commands and applied risk replay hold a shared
+`.traderrd-demo-operation.lock` in the resolved database directory before
+credentials or mutations, for the full operation (including watch mode).
+Worker and monitor may coexist; exclusive offline recovery refuses while either
+is active. Dry-run/read-only commands do not create or acquire this lock.
+
+The explicit applied owned-close command acquires the `demo-run` supervisor
+lock first, then the exclusive trading-operation lock, before credentials and
+until reconciliation returns. Stop the supervisor and individually launched
+worker/monitor processes first. Lock conflicts fail immediately without loading
+credentials; process exit or exceptions release ownership. The supervisor holds
+its supervisor lock followed by a shared trading-operation lock; no operation
+lock holder may subsequently acquire the supervisor lock. Close confirmation
+requires unique execution IDs, exact owned
 order/link, symbol, closing side and full cumulative filled quantity; flatness
 alone cannot release risk.

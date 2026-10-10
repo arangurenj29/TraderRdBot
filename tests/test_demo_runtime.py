@@ -14,6 +14,7 @@ from traderrd.demo_runtime import (
     DemoRuntimeAlreadyRunningError,
     DemoRuntimeSupervisor,
     _exclusive_runtime_lock,
+    _demo_operation_lock,
 )
 
 
@@ -157,6 +158,67 @@ class DemoRuntimeTests(unittest.TestCase):
                         pass
             with _exclusive_runtime_lock(lock_path):
                 pass
+
+    def test_operation_shared_owners_coexist_and_exclude_exclusive_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+            with _demo_operation_lock(database):
+                with _demo_operation_lock(database):
+                    with self.assertRaises(DemoRuntimeAlreadyRunningError):
+                        with _demo_operation_lock(database, exclusive=True):
+                            pass
+            with _demo_operation_lock(database, exclusive=True):
+                with self.assertRaises(DemoRuntimeAlreadyRunningError):
+                    with _demo_operation_lock(database):
+                        pass
+
+    def test_operation_lock_releases_after_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+            with self.assertRaisesRegex(ValueError, "interrupted"):
+                with _demo_operation_lock(database, exclusive=True):
+                    raise ValueError("interrupted")
+            with _demo_operation_lock(database):
+                pass
+
+    def test_supervisor_refuses_exclusive_operation_and_releases_supervisor_lock(self) -> None:
+        from traderrd.demo_runtime import _LOCK_NAME
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+            with (
+                _demo_operation_lock(database, exclusive=True),
+                patch("subprocess.Popen") as spawn,
+            ):
+                supervisor = DemoRuntimeSupervisor(database, "missing.env", 30, process_factory=spawn)
+                with self.assertRaises(DemoRuntimeAlreadyRunningError):
+                    supervisor.run()
+                spawn.assert_not_called()
+                with _exclusive_runtime_lock(database.parent / _LOCK_NAME):
+                    pass
+
+    def test_operation_lock_resolves_database_aliases_to_same_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "runtime.sqlite3"
+            database.touch()
+            alias = root / "alias.sqlite3"
+            alias.symlink_to(database)
+            with _demo_operation_lock(database):
+                with self.assertRaises(DemoRuntimeAlreadyRunningError):
+                    with _demo_operation_lock(alias, exclusive=True):
+                        pass
+
+    def test_supervisor_acquires_supervisor_lock_before_operation_lock(self) -> None:
+        from traderrd.demo_runtime import _LOCK_NAME, _OPERATION_LOCK_NAME
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "runtime.sqlite3"
+            with _exclusive_runtime_lock(database.parent / _LOCK_NAME):
+                supervisor = DemoRuntimeSupervisor(database, "missing.env", 30)
+                with self.assertRaises(DemoRuntimeAlreadyRunningError):
+                    supervisor.run()
+                self.assertFalse((database.parent / _OPERATION_LOCK_NAME).exists())
 
     def test_cli_routes_demo_run_with_interval_and_no_real_account_switch(self) -> None:
         with (

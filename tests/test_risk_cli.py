@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from traderrd.risk_cli import run_risk_replay, run_risk_report
+from traderrd.demo_runtime import _demo_operation_lock
 
 
 COMMANDS = [
@@ -34,6 +35,15 @@ COMMANDS = [
 
 
 class RiskCliTests(unittest.TestCase):
+    def test_applied_replay_refuses_exclusive_operation_without_database_writes(self) -> None:
+        with (
+            _demo_operation_lock(self.database_path, exclusive=True),
+            patch("sys.stdout", new_callable=StringIO),
+        ):
+            self.assertEqual(run_risk_replay(self.commands_path, self.database_path, True), 1)
+            self.assertFalse(self.database_path.exists())
+            self.assertEqual(run_risk_replay(self.commands_path, self.database_path, False), 0)
+
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         root = Path(self.directory.name)
