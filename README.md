@@ -1,5 +1,25 @@
 # TraderRd Observer
 
+## Demo take-profit policy for new entries
+
+Newly bridged Demo signals opt into a take profit at **1.2% from the confirmed
+execution-volume-weighted entry price**: multiply by `1.012` for LONG or `0.988`
+for SHORT, then normalize using the symbol's existing tick-size rules. The
+original signal stop loss is retained, not recalculated from the fill price.
+
+The signal and original planned TP/SL remain available for audit. The opt-in
+rate and confirmed execution price are persisted separately; exchange protection
+and subsequent verification use the effective fill-derived TP. Each cumulative
+partial fill is protected, then the remainder is cancelled and any racing fill
+is reconciled before final protection is reported verified.
+
+Existing reservations and intents without the explicit opt-in retain their
+original TP/SL, including pending orders and restart recovery. There is no
+backfill, historical rewrite, or mass amendment of existing positions. Missing
+or contradictory owned execution-price evidence requires reconciliation rather
+than guessing a new TP. This policy is Demo-only and does not change risk sizing,
+source validation, the three-hour entry expiry, or the real-account prohibition.
+
 TraderRd Observer is a deliberately small, local-only MVP. It reads LONG and
 SHORT signal messages from one Telegram forum topic through the authenticated
 user's MTProto session, validates their risk parameters, deduplicates them, and

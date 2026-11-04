@@ -104,6 +104,19 @@ class ExecutionIntent:
     expires_at: datetime | None
     exchange_order_id: str | None = None
     filled_quantity: Decimal | None = None
+    fill_take_profit_rate: Decimal | None = None
+    filled_entry_price: Decimal | None = None
+
+    @property
+    def effective_take_profit(self) -> Decimal | None:
+        if self.fill_take_profit_rate is None:
+            return self.take_profit
+        if self.fill_take_profit_rate != Decimal("0.012"):
+            raise ValueError("Unsupported Demo fill-price take-profit policy")
+        if self.filled_entry_price is None:
+            return None
+        sign = Decimal("1") if self.direction is Direction.LONG else Decimal("-1")
+        return self.filled_entry_price * (Decimal("1") + sign * self.fill_take_profit_rate)
 
 
 def _floor_increment(value: Decimal, increment: Decimal) -> Decimal:

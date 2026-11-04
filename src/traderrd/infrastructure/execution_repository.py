@@ -121,6 +121,9 @@ class SQLiteDemoExecutionRepository:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(demo_execution_intents)")}
             if "filled_quantity" not in columns:
                 connection.execute("ALTER TABLE demo_execution_intents ADD COLUMN filled_quantity TEXT")
+            for name in ("fill_take_profit_rate", "filled_entry_price"):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE demo_execution_intents ADD COLUMN {name} TEXT")
 
     def record_account_snapshot(self, snapshot: DemoStrategyAccountSnapshot) -> None:
         """Atomically replace display-only account and position observations."""
@@ -171,7 +174,7 @@ class SQLiteDemoExecutionRepository:
                 ],
             )
 
-    def record_fill_quantity(self, intent_id: str, quantity: Decimal) -> ExecutionIntent:
+    def record_fill_quantity(self, intent_id: str, quantity: Decimal, filled_entry_price: Decimal | None = None) -> ExecutionIntent:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = self._get(connection, intent_id)
@@ -179,9 +182,18 @@ class SQLiteDemoExecutionRepository:
                 raise ValueError("Invalid owned execution quantity")
             if current.filled_quantity is not None and quantity < current.filled_quantity:
                 raise ValueError("Cumulative execution quantity cannot decrease")
+            if filled_entry_price is not None:
+                if not filled_entry_price.is_finite() or filled_entry_price <= 0:
+                    raise ValueError("Owned execution price must be positive")
+                if (current.filled_quantity == quantity and current.filled_entry_price is not None
+                    and current.filled_entry_price != filled_entry_price):
+                    raise ValueError("Cumulative execution price conflicts with stored evidence")
             connection.execute(
-                "UPDATE demo_execution_intents SET filled_quantity = ? WHERE intent_id = ?",
-                (canonical_decimal(quantity), intent_id),
+                "UPDATE demo_execution_intents SET filled_quantity = ?, filled_entry_price = ? WHERE intent_id = ?",
+                (canonical_decimal(quantity), _decimal(
+                    filled_entry_price if filled_entry_price is not None
+                    else current.filled_entry_price if current.filled_quantity == quantity else None
+                ), intent_id),
             )
             updated = self._get(connection, intent_id)
             if updated is None:
@@ -290,6 +302,7 @@ class SQLiteDemoExecutionRepository:
                     state=ExecutionIntentState.PLANNED,
                     exchange_order_id=None,
                     filled_quantity=None,
+                    filled_entry_price=None,
                 )
                 if comparable != intent:
                     raise ValueError("Execution intent ID conflicts with stored input")
@@ -300,8 +313,8 @@ class SQLiteDemoExecutionRepository:
                     intent_id, order_link_id, risk_command_id,
                     risk_reservation_id, kind, state, symbol, direction,
                     quantity, price, take_profit, stop_loss, expires_at,
-                    exchange_order_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exchange_order_id, created_at, updated_at, fill_take_profit_rate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent.intent_id,
@@ -320,6 +333,7 @@ class SQLiteDemoExecutionRepository:
                     intent.exchange_order_id,
                     now,
                     now,
+                    _decimal(intent.fill_take_profit_rate),
                 ),
             )
             self._event(connection, intent.intent_id, "planned", "risk_action", now)
@@ -598,6 +612,10 @@ class SQLiteDemoExecutionRepository:
             ),
             exchange_order_id=row["exchange_order_id"],
             filled_quantity=(Decimal(row["filled_quantity"]) if "filled_quantity" in row.keys() and row["filled_quantity"] else None),
+            fill_take_profit_rate=(Decimal(row["fill_take_profit_rate"])
+                                   if "fill_take_profit_rate" in row.keys() and row["fill_take_profit_rate"] else None),
+            filled_entry_price=(Decimal(row["filled_entry_price"])
+                                if "filled_entry_price" in row.keys() and row["filled_entry_price"] else None),
         )
 
     @contextmanager

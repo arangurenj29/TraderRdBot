@@ -119,6 +119,10 @@ def command_from_dict(payload: dict[str, Any]) -> RiskCommand:
                 entry=_decimal(payload, "entry"),
                 take_profit=_decimal(payload, "take_profit"),
                 stop_loss=_decimal(payload, "stop_loss"),
+                fill_take_profit_rate=(
+                    _decimal(payload, "fill_take_profit_rate")
+                    if payload.get("fill_take_profit_rate") is not None else None
+                ),
                 entry_expires_at=(
                     _datetime(payload, "entry_expires_at")
                     if payload.get("entry_expires_at") is not None
@@ -198,6 +202,8 @@ def command_to_dict(command: RiskCommand) -> dict[str, Any]:
             entry=proposal.entry,
             take_profit=proposal.take_profit,
             stop_loss=proposal.stop_loss,
+            **({"fill_take_profit_rate": canonical_decimal(proposal.fill_take_profit_rate)}
+               if proposal.fill_take_profit_rate is not None else {}),
             entry_expires_at=(
                 proposal.entry_expires_at.isoformat()
                 if proposal.entry_expires_at
@@ -426,6 +432,8 @@ def _reservation_from_dict(value: dict[str, Any]) -> RiskReservation:
 
 def _proposal_to_dict(value: TradeProposal) -> dict[str, Any]:
     return {
+        **({"fill_take_profit_rate": canonical_decimal(value.fill_take_profit_rate)}
+           if value.fill_take_profit_rate is not None else {}),
         "signal_id": value.signal_id,
         "symbol": value.symbol,
         "direction": value.direction.value,
@@ -440,6 +448,8 @@ def _proposal_to_dict(value: TradeProposal) -> dict[str, Any]:
 
 def _proposal_from_dict(value: dict[str, Any]) -> TradeProposal:
     return TradeProposal(
+        fill_take_profit_rate=(Decimal(value["fill_take_profit_rate"])
+                               if value.get("fill_take_profit_rate") is not None else None),
         signal_id=value["signal_id"],
         symbol=value["symbol"],
         direction=Direction(value["direction"]),

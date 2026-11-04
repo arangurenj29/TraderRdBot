@@ -1,0 +1,23 @@
+# Demo fill-price take profit
+Objective: opt new Demo entries into a fill-derived TP while retaining original source data and legacy behavior. Branch: `codex/demo-fill-price-tp`.
+Delivery: `ask-on-risk`, approximately 380 authored changed lines forecast; no push/merge/deployment authorized. Runner: Python 3.12 unittest, network mocked.
+
+## Specs
+- **S1** — "Sí, impleméntalo solo para nuevas operaciones Demo, calculando el TP al 1,2% del precio real de ejecución y manteniendo el SL original, sin tocar las órdenes ni posiciones existentes."
+  Acceptance: new long/short entries derive TP from complete owned cumulative fill VWAP with instrument tick normalization; source TP and original SL remain unchanged. Legacy stored reservations/intents retain their previous behavior. Applied state and restart recovery preserve this distinction. Checks exercise public planner/bridge/reconciliation interfaces, persistence, legacy behavior, partial-fill increases, and rejected incomplete price evidence.
+  Scope: local implementation/tests/docs only; no remote execution, live order changes, deployment, or new risk policy.
+
+## Tasks
+- **T1** — S1; inline; implemented, checks passed; implement explicit opt-in and persisted fill evidence with tests/docs; commit pending. Risk: items 1 (additive persisted format), 3 (shared reconciliation/idempotency), 4 (partial-fill cancellation race).
+- **T2** — S1; delegated verification; S1 PASS after bounded recheck; independent high-risk checks after own focused/full tests and differential legacy probe; same final work-unit boundary pending.
+
+## Log
+- **L1** — User request: "Sí, impleméntalo solo para nuevas operaciones Demo, calculando el TP al 1,2% del precio real de ejecución y manteniendo el SL original, sin tocar las órdenes ni posiciones existentes."
+- Mapping: current bridge copies signal TP/SL into proposal; planner persists intent; reconciliation confirms owned cumulative quantity but ignores execution prices. Preserve original values and attach a durable explicit opt-in only when creating a new proposal. Legacy defaults must remain opt-out; recovered old commands must not acquire the new strategy. Persist computed fill-derived protection separately for restart and cumulative-fill reconciliation.
+- Route: inline writer (one coupled behavior, no independent parallel units). Read-only explorer used because mapping exceeded the bounded inline evidence budget. Independent verifier is required by named risk items 1/3/4, not line count or native tier.
+- Test-first: relevant deterministic mocked reconciliation tests exist; observe RED before behavior changes. Test scratch outside checkout. No source changes at baseline; branch point `562727f319351919bb7a9bb824597bb3163d1465`.
+- Engram mirror created/read back as observation 3564. RED: three new public reconciliation tests failed on absent policy field (four errors including long/short subtests). GREEN: 93 focused tests; compileall and full 312 tests passed using Python 3.12. Additive nullable policy/VWAP columns, opt-in proposal codecs omit absent policy to preserve legacy command hashes, original levels retained, effective TP derived during protection and restart verification. No remote actions. Next step: differential legacy probe, independent verifier, applicable native risk assessment, work-unit commit.
+
+- Independent S1 verification found one blocker: owned-close recovery after a cancellation-racing fill grew confirmed quantity but retained the old partial VWAP. No incorrect TP POST was demonstrated. One correction batch now recalculates VWAP even during owned-close recovery when price evidence exists, otherwise invalidates the stale VWAP on quantity growth without blocking quantity-proven closure. New public-interface regression observed RED (two stale-price failures) then GREEN (prices available and unavailable); original SL and no-protection-POST behavior pinned. Verifier recheck pending, limited to this blocker. Other checks passed: actual baseline schema migration, legacy/interrupted bridge recovery, seven invalid price/side cases, four exact CLI stdout/stderr/exit differential probes.
+
+- Final own checks: compileall, full 313 tests, and diff --check PASS after correction. Independent S1 recheck PASS: actual VWAP after racing fill, NULL when price evidence unavailable, no POST, original SL unchanged, correct persisted pair after restart. Four CLI differential probes and actual baseline schema compatibility passed in the original bounded verification. Scratch paths recorded for parent cleanup. Estimated implementation slice remains below 400 authored changed lines. Native review and local commit closure next; no publishing or deployment authorized.

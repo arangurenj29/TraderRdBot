@@ -104,8 +104,11 @@ class TradeProposal:
     take_profit: Decimal
     stop_loss: Decimal
     entry_expires_at: datetime | None = None
+    fill_take_profit_rate: Decimal | None = None
 
     def __post_init__(self) -> None:
+        if self.fill_take_profit_rate is not None and self.fill_take_profit_rate != Decimal("0.012"):
+            raise ValueError("Unsupported Demo fill-price take-profit policy")
         if not self.signal_id:
             raise ValueError("Signal ID is required")
         if not self.symbol or self.symbol != self.symbol.upper():

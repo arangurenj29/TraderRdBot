@@ -185,6 +185,141 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
             RULES, "risk-proposal"
         )[0]
 
+    def test_fill_price_tp_long_short_and_restart_leave_source_levels_unchanged(self):
+        for direction, side, price, expected, source_tp, source_sl in (
+            (Direction.LONG, "Buy", "100.5", "101.7", "100.8", "97"),
+            (Direction.SHORT, "Sell", "99.5", "98.4", "99.2", "103"),
+        ):
+            with self.subTest(direction=direction):
+                path = Path(self.directory.name) / (side + ".sqlite3")
+                repo = SQLiteDemoExecutionRepository(path)
+                repo.initialize()
+                entry = replace(self.entry, direction=direction,
+                                take_profit=Decimal(source_tp), stop_loss=Decimal(source_sl),
+                                fill_take_profit_rate=Decimal("0.012"))
+                repo.save_planned(entry)
+                client = FakeExecutionClient()
+                original = client.request
+                def request(method, endpoint, params=None, body=None, **kwargs):
+                    payload = original(method, endpoint, params, body, **kwargs)
+                    if endpoint == "/v5/execution/list":
+                        payload["result"]["list"][0].update(execPrice=price, side=side)
+                    if endpoint == "/v5/position/list":
+                        payload["result"]["list"][0].update(side=side, takeProfit=expected, stopLoss=source_sl)
+                    return payload
+                client.request = request
+                service = DemoExecutionService(client, repo, RULES)
+                result = service.reconcile(entry.intent_id)
+                self.assertEqual(result.state, ExecutionIntentState.PROTECTION_VERIFIED)
+                self.assertEqual(result.filled_entry_price, Decimal(price))
+                self.assertEqual(result.take_profit, entry.take_profit)
+                self.assertEqual(result.stop_loss, entry.stop_loss)
+                posted = [body for method, endpoint, body in client.calls
+                          if endpoint == "/v5/position/trading-stop"]
+                self.assertEqual(posted[-1]["takeProfit"], expected)
+                self.assertEqual(posted[-1]["stopLoss"], source_sl)
+                reopened = SQLiteDemoExecutionRepository(path)
+                self.assertEqual(reopened.save_planned(entry), result)
+                client.calls.clear()
+                self.assertEqual(DemoExecutionService(client, reopened, RULES).reconcile(entry.intent_id), result)
+                self.assertFalse(any(method == "POST" for method, _, _ in client.calls))
+
+    def test_opted_in_missing_execution_price_never_sets_guessed_tp(self):
+        entry = replace(self.entry, fill_take_profit_rate=Decimal("0.012"))
+        self.execution_repository.save_planned(entry)
+        result = self.service.reconcile(entry.intent_id)
+        self.assertEqual(result.state, ExecutionIntentState.RECONCILIATION_REQUIRED)
+        self.assertIsNone(result.filled_entry_price)
+        self.assertFalse(any(path == "/v5/position/trading-stop" for _, path, _ in self.client.calls))
+
+    def test_partial_cancel_racing_fill_recalculates_vwap_tp(self):
+        entry = replace(self.entry, fill_take_profit_rate=Decimal("0.012"))
+        self.execution_repository.save_planned(entry)
+        phase = [0]
+        original = self.client.request
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/order/cancel":
+                phase[0] = 1
+            payload = original(method, path, params, body, **kwargs)
+            qty = "4.838" if phase[0] else "2"
+            if path in {"/v5/order/realtime", "/v5/order/history"}:
+                payload["result"]["list"][0].update(
+                    orderStatus="Cancelled" if phase[0] else "PartiallyFilled", cumExecQty=qty)
+            if path == "/v5/execution/list":
+                row = payload["result"]["list"][0]
+                row.update(execQty="2", execPrice="100")
+                if phase[0]:
+                    payload["result"]["list"].append(dict(row, execId="execution-2", execQty="2.838", execPrice="101"))
+            if path == "/v5/position/list":
+                payload["result"]["list"][0].update(
+                    size=qty, takeProfit="101.7" if phase[0] else "101.2", stopLoss="97")
+            return payload
+        self.client.request = request
+        result = self.service.reconcile(entry.intent_id)
+        expected = (Decimal("200") + Decimal("286.638")) / Decimal("4.838")
+        self.assertEqual(result.state, ExecutionIntentState.PROTECTION_VERIFIED)
+        self.assertEqual(result.filled_entry_price, expected)
+        posted = [body["takeProfit"] for method, path, body in self.client.calls
+                  if path == "/v5/position/trading-stop"]
+        self.assertEqual(posted, ["101.2", "101.7"])
+
+    def test_legacy_intent_and_risk_roundtrip_remain_opted_out(self):
+        from traderrd.application.risk_engine import command_from_dict, command_to_dict
+        command = ProposeRiskReservation("legacy", START, Decimal("1000"),
+            TradeProposal("legacy-signal", "BTCUSDT", Direction.LONG,
+                          Decimal("100"), Decimal("100.8"), Decimal("97")))
+        payload = command_to_dict(command)
+        self.assertNotIn("fill_take_profit_rate", payload)
+        self.assertEqual(command_to_dict(command_from_dict(payload)), payload)
+        self.assertIsNone(self.entry.fill_take_profit_rate)
+        self.execution_repository.save_planned(self.entry)
+        self.execution_repository.initialize()
+        result = self.service.reconcile(self.entry.intent_id)
+        self.assertEqual(result.state, ExecutionIntentState.PROTECTION_VERIFIED)
+        self.assertIsNone(result.filled_entry_price)
+        self.assertEqual(result.effective_take_profit, Decimal("100.8"))
+        self.assertEqual(result.stop_loss, Decimal("97"))
+        self.assertEqual(self.execution_repository.save_planned(self.entry), result)
+
+    def test_operator_close_does_not_retain_stale_partial_fill_vwap(self):
+        for prices_available in (True, False):
+            with self.subTest(prices_available=prices_available):
+                path = Path(self.directory.name) / f"operator-{prices_available}.sqlite3"
+                repo = SQLiteDemoExecutionRepository(path)
+                repo.initialize()
+                entry = replace(self.entry, fill_take_profit_rate=Decimal("0.012"))
+                repo.save_planned(entry)
+                client = FakeExecutionClient()
+                original, phase = client.request, [0]
+                def request(method, endpoint, params=None, body=None, **kwargs):
+                    payload = original(method, endpoint, params, body, **kwargs)
+                    qty = "4.838" if phase[0] else "2"
+                    if endpoint in {"/v5/order/realtime", "/v5/order/history"}:
+                        payload["result"]["list"][0].update(orderStatus="Cancelled" if phase[0] else "PartiallyFilled", cumExecQty=qty)
+                    if endpoint == "/v5/execution/list":
+                        row = payload["result"]["list"][0]
+                        row.update(execQty="2", execPrice="100")
+                        if phase[0]:
+                            payload["result"]["list"].append(dict(row, execId="execution-2", execQty="2.838", execPrice="101"))
+                            if not prices_available:
+                                for execution in payload["result"]["list"]:
+                                    execution.pop("execPrice")
+                    if endpoint == "/v5/position/list":
+                        payload["result"]["list"][0].update(size=qty, takeProfit="101.2", stopLoss="97")
+                    return payload
+                client.request = request
+                service = DemoExecutionService(client, repo, RULES)
+                service.reconcile(entry.intent_id)
+                self.assertEqual(repo.get(entry.intent_id).filled_entry_price, Decimal("100"))
+                phase[0] = 1
+                client.calls.clear()
+                result = service.reconcile_for_operator_close(entry.intent_id)
+                expected = Decimal("486.638") / Decimal("4.838") if prices_available else None
+                self.assertEqual(result.state, ExecutionIntentState.FILLED)
+                self.assertEqual(result.filled_quantity, Decimal("4.838"))
+                self.assertEqual(result.filled_entry_price, expected)
+                self.assertFalse(any(method == "POST" for method, _, _ in client.calls))
+
     def test_late_fill_retains_risk_after_expiry(self) -> None:
         self.service.submit(self.entry)
         snapshot = DemoStrategyAccountSnapshot(

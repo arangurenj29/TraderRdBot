@@ -111,6 +111,20 @@ class DemoBridgeTests(unittest.TestCase):
         self.assertEqual(result.decision.projected_risk, Decimal("30"))
         self.assertEqual(result.intents[0].expires_at, NOW + timedelta(hours=2, minutes=50))
 
+    def test_new_demo_policy_survives_risk_reload_without_rewriting_source(self):
+        service = self._service(FakeSnapshotProvider())
+        preview = service.process(101, SENDER_ID)
+        self.assertEqual(preview.intents[0].fill_take_profit_rate, Decimal("0.012"))
+        applied = service.process(101, SENDER_ID, persist_risk=True)
+        state = SQLiteRiskStateRepository(self.database).load_state()
+        proposal = next(iter(state.reservations.values())).proposal
+        self.assertEqual(proposal.fill_take_profit_rate, Decimal("0.012"))
+        source = SQLiteDemoBridgeRepository(self.database).get_scoped_signal(2180632014, 231508, SENDER_ID, 101)
+        self.assertEqual(proposal.take_profit, source.take_profit)
+        self.assertEqual(proposal.stop_loss, source.stop_loss)
+        self.assertEqual(applied.intents[0].fill_take_profit_rate, Decimal("0.012"))
+        self.assertTrue(service.process(101, SENDER_ID, persist_risk=True).duplicate)
+
     def test_stale_signal_can_be_inspected_but_never_persisted(self) -> None:
         self._store(
             102,

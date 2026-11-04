@@ -116,6 +116,7 @@ class DemoSignalBridgeService:
             take_profit=signal.take_profit,
             stop_loss=signal.stop_loss,
             entry_expires_at=expires_at,
+            fill_take_profit_rate=Decimal("0.012"),
         )
         engine = PortfolioRiskEngine()
 

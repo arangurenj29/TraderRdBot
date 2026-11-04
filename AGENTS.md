@@ -10,6 +10,13 @@ and exchange reconciliation independently visible and restartable.
 
 ## Non-negotiable invariants
 
+- New Demo bridge proposals persist an explicit fill-price TP opt-in. Only those
+  entry intents derive TP at 1.2% from confirmed owned cumulative execution VWAP,
+  normalized to tick size. Keep the original signal SL and audit levels intact.
+  Legacy proposals/intents default to no opt-in and must not be upgraded during
+  migration, replay, partial-fill recovery, or restart. Persist fill quantity and
+  VWAP together; protect partial fills and recheck cancellation-racing fills.
+
 - Telegram source scope is exact: parent chat `2180632014`, topic `231508`,
   seed message `231906`, numeric sender `8003985182`.
 - Bybit private execution uses only `https://api-demo.bybit.com`. Mainnet and

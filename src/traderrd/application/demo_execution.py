@@ -100,6 +100,8 @@ class DemoExecutionPlanner:
                     take_profit=reservation.proposal.take_profit,
                     stop_loss=reservation.proposal.stop_loss,
                     expires_at=action.expires_at,
+                    fill_take_profit_rate=(reservation.proposal.fill_take_profit_rate
+                                           if kind is ExecutionIntentKind.ENTRY else None),
                 )
             )
         return intents
@@ -377,7 +379,26 @@ class DemoExecutionService:
             )
         if size != quantity or not _position_side_matches(position, intent.direction):
             return self._unresolved(intent, "fill_position_mismatch")
-        self._repository.record_fill_quantity(intent.intent_id, quantity)
+        filled_entry_price = None
+        if intent.fill_take_profit_rate is not None:
+            try:
+                prices = [_safe_decimal(row.get("execPrice")) for row in rows]
+            except DemoExecutionError:
+                prices = []
+            expected_side = "Buy" if intent.direction is Direction.LONG else "Sell"
+            valid_prices = (len(prices) == len(rows) and all(price > 0 for price in prices)
+                            and all(row.get("side") == expected_side for row in rows))
+            if not valid_prices:
+                if protect:
+                    return self._unresolved(intent, "incomplete_execution_price_evidence")
+                # Owned-close recovery needs quantity proof, not a guessed TP.
+                # The repository invalidates stale VWAP if that quantity grows.
+            else:
+                filled_entry_price = sum(
+                    (_safe_decimal(row["execQty"]) * price for row, price in zip(rows, prices)),
+                    Decimal("0"),
+                ) / quantity
+        self._repository.record_fill_quantity(intent.intent_id, quantity, filled_entry_price)
         filled = self._repository.transition(
             intent.intent_id, ExecutionIntentState.FILLED, "fill_confirmed",
             "cumulative_execution_and_position_confirmed",
@@ -627,7 +648,8 @@ class DemoExecutionService:
             )
         expected_quantity = intent.filled_quantity or intent.quantity
         if (size != expected_quantity
-            or _safe_decimal(position.get("takeProfit", "0")) != self._rules.normalize_entry_price(intent.take_profit, intent.direction)
+            or intent.effective_take_profit is None
+            or _safe_decimal(position.get("takeProfit", "0")) != self._rules.normalize_entry_price(intent.effective_take_profit, intent.direction)
             or _safe_decimal(position.get("stopLoss", "0")) != self._rules.normalize_entry_price(intent.stop_loss, intent.direction)):
             return self._unresolved(intent, "protected_position_or_tp_sl_mismatch")
         return intent
@@ -688,10 +710,10 @@ class DemoExecutionService:
         return matches[0]
 
     def _set_and_verify_protection(self, intent: ExecutionIntent) -> None:
-        if intent.take_profit is None or intent.stop_loss is None:
+        if intent.effective_take_profit is None or intent.stop_loss is None:
             raise DemoExecutionError("protection_missing", "TP and SL are required")
         take_profit = self._rules.normalize_entry_price(
-            intent.take_profit, intent.direction
+            intent.effective_take_profit, intent.direction
         )
         stop_loss = self._rules.normalize_entry_price(
             intent.stop_loss, intent.direction
