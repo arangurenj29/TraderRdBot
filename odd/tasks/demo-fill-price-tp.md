@@ -1,15 +1,21 @@
 # Demo fill-price take profit
 Objective: opt new Demo entries into a fill-derived TP while retaining original source data and legacy behavior. Branch: `codex/demo-fill-price-tp`.
-Delivery: `ask-on-risk`, approximately 380 authored changed lines forecast; no push/merge/deployment authorized. Runner: Python 3.12 unittest, network mocked.
+Delivery: direct publication through `dev` then `main`, explicitly authorized; verified code remains unchanged, below 400 authored changed lines. Runner: Python 3.12 unittest, network mocked.
 
 ## Specs
 - **S1** — "Sí, impleméntalo solo para nuevas operaciones Demo, calculando el TP al 1,2% del precio real de ejecución y manteniendo el SL original, sin tocar las órdenes ni posiciones existentes."
   Acceptance: new long/short entries derive TP from complete owned cumulative fill VWAP with instrument tick normalization; source TP and original SL remain unchanged. Legacy stored reservations/intents retain their previous behavior. Applied state and restart recovery preserve this distinction. Checks exercise public planner/bridge/reconciliation interfaces, persistence, legacy behavior, partial-fill increases, and rejected incomplete price evidence.
   Scope: local implementation/tests/docs only; no remote execution, live order changes, deployment, or new risk policy.
 
+- **S2** — "Publícalo primero en dev y luego en main, y despliégalo en el servidor usando la misma clave SSH. Comprueba que el TP del 1,2% se aplique solo a nuevas operaciones Demo, sin tocar las existentes."
+  Scope: publish normal fast-forward updates to origin `arangurenj29/TraderRdBot`, then deploy to the previously authorized server `ubuntu@146.181.63.164` with `/Users/anderson/.ssh/traderrd_oci.key`, project `/home/ubuntu/TraderRd`. Preserve credentials, persistent volume, history, and all preexisting intent policy/TP/SL inputs. No artificial orders, account reset, manual order amendments, or force-push. Checks: fresh before/after account and ledger evidence, verified SQLite API backup, isolated image tests, source hash match, health and independent postdeployment read-only verification.
+
 ## Tasks
 - **T1** — S1; inline; complete; explicit opt-in and persisted fill evidence with tests/docs; commit `95cba5b121ff9f29b7d792a6fbfa5f4dfb33e76f`. Risk: items 1 (additive persisted format), 3 (shared reconciliation/idempotency), 4 (partial-fill cancellation race).
 - **T2** — S1; delegated verification; complete, S1 PASS after bounded recheck; proof included in work unit `95cba5b121ff9f29b7d792a6fbfa5f4dfb33e76f`.
+
+- **T3** — S2; inline; pending; publish verified feature to dev then main without rewriting history; commit/evidence pending.
+- **T4** — S1-S2; delegated external deployment and independent verification; pending; existing reviewed runtime only, no source authoring. Reason: large-task external Docker build/deployment and named risk item 5 (delivery); separate read-only verifier checks isolation. Commit/evidence pending.
 
 ## Log
 - **L1** — User request: "Sí, impleméntalo solo para nuevas operaciones Demo, calculando el TP al 1,2% del precio real de ejecución y manteniendo el SL original, sin tocar las órdenes ni posiciones existentes."
@@ -26,3 +32,6 @@ Delivery: `ask-on-risk`, approximately 380 authored changed lines forecast; no p
 - Review setup initially stopped for stale managed assets. Executed its exact `gentle-ai sync --agent codex` continuation; only managed global tooling assets changed, not repository runtime bytes. Re-preflight reviewed the unchanged commit. All owned verifier/test scratch was removed by the parent.
 - Final state: S1 implemented and verified locally. No push, merge, server access, deployment, or existing exchange order/position mutation occurred. Tests remained mocked and network-free. Next step, only if separately authorized: publish/integrate/deploy the verified feature; new intents then opt in while legacy intents remain unchanged.
 - Risk: items 1 (additive persisted schema), 3 (legacy/shared reconciliation compatibility), 4 (partial-fill cancellation races); independently verified and natively reviewed.
+
+- **L2 — 2026-11-04** — "Publícalo primero en dev y luego en main, y despliégalo en el servidor usando la misma clave SSH. Comprueba que el TP del 1,2% se aplique solo a nuevas operaciones Demo, sin tocar las existentes."
+- S2 explicitly extends prior local-only scope. Publish first dev then main using configured Git authentication. Build immutable source-only image and preserve rollback source/image; take integrity-verified SQLite API backup. Capture preexisting ledger/exchange state before restart and verify additive migration leaves all preexisting intents opted out with original levels. Test new policy in an isolated image with mocked exchange, never by creating a live order. If no new natural signal arrives, state live adoption not yet observed. No source modifications or new native review for unchanged reviewed runtime.
