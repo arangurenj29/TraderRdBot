@@ -62,6 +62,9 @@ class DemoLifecycleMonitor:
 
     def close_owned_position(self, intent_id: str):
         """Explicit operator recovery: evidence, durable close request, then flat/PnL."""
+        return self._close_owned_position(intent_id, command_prefix="demo-operator-close")
+
+    def _close_owned_position(self, intent_id: str, *, command_prefix: str):
         if getattr(getattr(self._client, "config", None), "base_url", None) != "https://api-demo.bybit.com":
             raise DemoMonitorError("demo_only_guard", "Operator close is restricted to Bybit Demo Trading")
         entry = self._execution.get(intent_id)
@@ -92,13 +95,14 @@ class DemoLifecycleMonitor:
         already_flat = None
         if close is None or (close.state is ExecutionIntentState.PLANNED
                              and not self._execution.has_submission_attempt(close.intent_id)):
-            filled = service.reconcile_for_operator_close(entry.intent_id)
+            filled = service.reconcile_for_operator_close(entry.intent_id,
+                explicit_ownership=command_prefix == "demo-tp-close")
             if filled.state is ExecutionIntentState.POSITION_CLOSED_PENDING:
                 already_flat = filled
                 filled = replace(filled, state=ExecutionIntentState.FILLED)
             self._sync_risk(filled, snapshot, rules, now)
         state = self._risk.load_state()
-        command_id = f"demo-operator-close:{entry.intent_id}"
+        command_id = f"{command_prefix}:{entry.intent_id}"
         command = self._risk.get_command(command_id) or RequestPositionClose(
             command_id, max(self._clock(), snapshot.captured_at, state.as_of), entry.risk_reservation_id,
         )
@@ -147,6 +151,7 @@ class DemoLifecycleMonitor:
             snapshots[symbol] = (snapshot, rules)
 
         risk_updates = 0
+        errors: list[DemoExecutionError] = []
         for intent in intents:
             snapshot, rules = snapshots[intent.symbol]
             service = DemoExecutionService(
@@ -167,14 +172,21 @@ class DemoLifecycleMonitor:
                     # unresolved and risk remains fail-closed.
                     if not service.attribute_closed_outcome(reconciled, now):
                         continue
-            except DemoExecutionError:
+            except DemoExecutionError as exc:
+                if exc.code == "take_profit_crossed" and intent.fill_take_profit_rate is not None:
+                    try:
+                        self._close_owned_position(intent.intent_id, command_prefix="demo-tp-close")
+                    except DemoExecutionError as close_error:
+                        errors.append(close_error)
+                    continue
                 current = self._execution.get(intent.intent_id)
                 if current is not None and current.state not in {
                     ExecutionIntentState.PROTECTION_VERIFIED,
                     ExecutionIntentState.POSITION_CLOSED_PENDING,
                 }:
                     risk_updates += self._sync_risk(current, snapshot, rules, now)
-                raise
+                errors.append(exc)
+                continue
             risk_updates += self._sync_risk(reconciled, snapshot, rules, now)
 
         expired = self._execution.expirable_entries(now)
@@ -197,6 +209,10 @@ class DemoLifecycleMonitor:
             for intent in intents
         ]
         states = [state.state for state in final_states if state is not None]
+        if errors:
+            # Continue other owned intents, but never report a healthy cycle
+            # while protection or close evidence is still unavailable.
+            raise errors[0]
         return DemoMonitorResult(
             inspected=len(intents),
             working=sum(state is ExecutionIntentState.WORKING for state in states),

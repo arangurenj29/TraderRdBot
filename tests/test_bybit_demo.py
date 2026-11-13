@@ -189,6 +189,7 @@ class BybitDemoSigningTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.code, "wallet_balance_unavailable")
+        self.assertEqual(raised.exception.exchange_code, 10001)
         rendered = str(raised.exception)
         self.assertIn("wallet_balance_unavailable", rendered)
         self.assertNotIn("raw-private-marker", rendered)

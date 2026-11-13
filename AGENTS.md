@@ -16,6 +16,12 @@ and exchange reconciliation independently visible and restartable.
   Legacy proposals/intents default to no opt-in and must not be upgraded during
   migration, replay, partial-fill recovery, or restart. Persist fill quantity and
   VWAP together; protect partial fills and recheck cancellation-racing fills.
+  Opted-in protection explicitly uses LastPrice. If a fresh exact-symbol ticker
+  proves the normalized TP already reached, use the durable owned reduce-only
+  close path, never rebase the target. Cancel and reconcile any entry remainder
+  first; retain risk until complete close/PnL proof. Legacy intents stay opted
+  out. One intent's exchange error must not starve later intents or falsely
+  report a healthy monitor cycle.
 
 - Telegram source scope is exact: parent chat `2180632014`, topic `231508`,
   seed message `231906`, numeric sender `8003985182`.

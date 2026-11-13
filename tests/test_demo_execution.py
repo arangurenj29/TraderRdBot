@@ -75,6 +75,8 @@ class FakeExecutionClient:
     ) -> dict[str, object]:
         values: dict[str, object] = body or params or {}
         self.calls.append((method, path, values))
+        if path == "/v5/market/tickers":
+            return {"result": {"list": [{"symbol": str(values["symbol"]), "lastPrice": "100"}]}}
         if method == "POST" and path == "/v5/order/create":
             self.order_link_id = str(values["orderLinkId"])
             return {"retCode": 0, "result": {"orderId": "exchange-order-1"}}
@@ -185,6 +187,214 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
             RULES, "risk-proposal"
         )[0]
 
+    def _missed_tp_fixture(self, last="102", *, partial=False, uncertain=False):
+        self.entry = replace(self.entry, fill_take_profit_rate=Decimal("0.012"))
+        self.execution_repository.save_planned(self.entry)
+        self.client.config = SimpleNamespace(base_url="https://api-demo.bybit.com")
+        original, phase = self.client.request, {"cancelled": False, "failed": False}
+        side = "Buy" if self.entry.direction is Direction.LONG else "Sell"
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/market/tickers":
+                return {"result": {"list": [{"symbol": "BTCUSDT", "lastPrice": last}]}}
+            if path == "/v5/order/cancel":
+                phase["cancelled"] = True
+            if path == "/v5/order/create" and body.get("reduceOnly"):
+                self.client.flat_position = True
+                if uncertain and not phase["failed"]:
+                    phase["failed"] = True
+                    original(method, path, params, body, **kwargs)
+                    raise DemoExecutionError("transport_error", "Unknown close outcome")
+            payload = original(method, path, params, body, **kwargs)
+            entry_request = params and params.get("orderLinkId") == self.entry.order_link_id
+            if path in {"/v5/order/realtime", "/v5/order/history"} and entry_request and partial:
+                payload["result"]["list"][0].update(
+                    orderStatus="Cancelled" if phase["cancelled"] else "PartiallyFilled",
+                    cumExecQty="4.838" if phase["cancelled"] else "2")
+            if path == "/v5/execution/list" and entry_request:
+                payload["result"]["list"][0].update(side=side, execPrice="100", execQty="2" if partial and not phase["cancelled"] else "4.838")
+            elif path == "/v5/execution/list":
+                payload["result"]["list"][0]["side"] = "Sell" if side == "Buy" else "Buy"
+            if path == "/v5/position/list":
+                payload["result"]["list"][0]["side"] = side
+            if path == "/v5/position/closed-pnl" and self.client.closed_pnl_rows is None:
+                payload["result"]["list"][0]["side"] = "Sell" if side == "Buy" else "Buy"
+            if path == "/v5/position/list" and partial and not phase["cancelled"]:
+                payload["result"]["list"][0]["size"] = "2"
+            return payload
+        self.client.request = request
+        self.service.submit(self.entry)
+        self.client.calls.clear()
+
+    def test_crossed_tp_closes_owned_position_once_and_attributes_risk(self):
+        self._missed_tp_fixture()
+        self._monitor_at().run_cycle()
+        entry = self.execution_repository.get(self.entry.intent_id)
+        self.assertEqual(entry.state, ExecutionIntentState.POSITION_CLOSED)
+        self.assertEqual(entry.stop_loss, Decimal("97"))
+        self.assertTrue(self.execution_repository.outcome_is_attributed(entry.risk_reservation_id))
+        self.assertEqual(SQLiteRiskStateRepository(self.database_path).load_state().reservations[entry.risk_reservation_id].status.value, "closed")
+        before = self.execution_repository.counts()
+        self._monitor_at(4).run_cycle()
+        self.assertEqual(self.execution_repository.counts(), before)
+        posts = [body for method, path, body in self.client.calls if method == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(posts[0]["reduceOnly"])
+        self.assertEqual((posts[0]["side"], posts[0]["qty"]), ("Sell", "4.838"))
+        self.assertFalse(any(path == "/v5/position/trading-stop" for _, path, _ in self.client.calls))
+
+    def test_crossed_tp_partial_cancels_remainder_and_rechecks_cumulative_fill(self):
+        self._missed_tp_fixture(partial=True)
+        self._monitor_at().run_cycle()
+        posts = [(path, body) for method, path, body in self.client.calls if method == "POST"]
+        self.assertEqual([path for path, _ in posts], ["/v5/order/cancel", "/v5/order/create"])
+        self.assertEqual(posts[-1][1]["qty"], "4.838")
+        self.assertTrue(posts[-1][1]["reduceOnly"])
+
+    def test_crossed_short_tp_reduces_with_buy_and_original_stop(self):
+        self.database_path = Path(self.directory.name) / "short.sqlite3"
+        risk = SQLiteRiskStateRepository(self.database_path)
+        risk.initialize()
+        service = RiskEngineService(risk)
+        service.execute(InitializeRiskEngine("init", START, Decimal("1000")))
+        service.execute(ProposeRiskReservation("risk-proposal", START + timedelta(minutes=1), Decimal("1000"),
+            TradeProposal("short-signal", "BTCUSDT", Direction.SHORT, Decimal("100"), Decimal("99.2"), Decimal("103"))))
+        self.execution_repository = SQLiteDemoExecutionRepository(self.database_path)
+        self.execution_repository.initialize()
+        self.entry = DemoExecutionPlanner(self.database_path).preview(RULES, "risk-proposal")[0]
+        self.service = DemoExecutionService(self.client, self.execution_repository, RULES,
+                                           clock=lambda: START + timedelta(minutes=2))
+        self._missed_tp_fixture(last="98")
+        self._monitor_at().run_cycle()
+        entry = self.execution_repository.get(self.entry.intent_id)
+        self.assertEqual(entry.state, ExecutionIntentState.POSITION_CLOSED)
+        self.assertEqual(entry.stop_loss, Decimal("103"))
+        posted = [body for _, path, body in self.client.calls if path == "/v5/order/create"]
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["side"], "Buy")
+        self.assertTrue(posted[0]["reduceOnly"])
+
+    def test_crossed_tp_uncertain_close_restarts_without_second_submission(self):
+        self._missed_tp_fixture(uncertain=True)
+        with self.assertRaises(DemoExecutionError):
+            self._monitor_at().run_cycle()
+        self._monitor_at(4).run_cycle()
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id).state, ExecutionIntentState.POSITION_CLOSED)
+        self.assertEqual(len([1 for _, path, body in self.client.calls if path == "/v5/order/create" and body.get("reduceOnly")]), 1)
+
+    def test_crossed_tp_close_without_pnl_keeps_risk_reserved(self):
+        self._missed_tp_fixture()
+        self.client.closed_pnl_rows = []
+        self._monitor_at().run_cycle()
+        self._monitor_at(4).run_cycle()
+        risk = SQLiteRiskStateRepository(self.database_path).load_state()
+        self.assertEqual(risk.reservations[self.entry.risk_reservation_id].status.value, "close_requested")
+        self.assertGreater(risk.reservations[self.entry.risk_reservation_id].reserved_risk, 0)
+        self.assertFalse(self.execution_repository.outcome_is_attributed(self.entry.risk_reservation_id))
+        self.assertEqual(len([1 for _, path, body in self.client.calls if path == "/v5/order/create" and body.get("reduceOnly")]), 1)
+
+    def test_crossed_tp_missing_explicit_execution_ownership_never_closes(self):
+        for fields in (("symbol",), ("orderLinkId",), ("orderId",), ("symbol", "orderLinkId", "orderId")):
+            with self.subTest(fields=fields):
+                self.database_path = Path(self.directory.name) / ("missing-" + "-".join(fields) + ".sqlite3")
+                make_risk_database(self.database_path)
+                self.execution_repository = SQLiteDemoExecutionRepository(self.database_path)
+                self.execution_repository.initialize()
+                self.client = FakeExecutionClient()
+                self.service = DemoExecutionService(self.client, self.execution_repository, RULES,
+                    clock=lambda: START + timedelta(minutes=2))
+                self.entry = DemoExecutionPlanner(self.database_path).preview(RULES, "risk-proposal")[0]
+                self._missed_tp_fixture()
+                original = self.client.request
+                def request(method, path, params=None, body=None, **kwargs):
+                    payload = original(method, path, params, body, **kwargs)
+                    if path == "/v5/execution/list":
+                        for row in payload["result"]["list"]:
+                            for field in fields:
+                                row.pop(field, None)
+                    return payload
+                self.client.request = request
+                with self.assertRaises(DemoExecutionError):
+                    self._monitor_at().run_cycle()
+                self.assertIsNone(self.execution_repository.find_close(self.entry.risk_reservation_id))
+                self.assertFalse(any(path == "/v5/order/create" for _, path, _ in self.client.calls))
+                risk = SQLiteRiskStateRepository(self.database_path).load_state()
+                self.assertNotEqual(risk.reservations[self.entry.risk_reservation_id].status.value, "closed")
+                self.assertGreater(risk.reservations[self.entry.risk_reservation_id].reserved_risk, 0)
+
+    def test_crossed_tp_during_protection_rejection_uses_new_quote_not_error_code(self):
+        self._missed_tp_fixture(last="100")
+        original, rejected = self.client.request, [False]
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/position/trading-stop":
+                rejected[0] = True
+                raise DemoExecutionError("trading_stop_unavailable", "Rejected", exchange_code=110092)
+            if path == "/v5/market/tickers" and rejected[0]:
+                return {"result": {"list": [{"symbol": "BTCUSDT", "lastPrice": "102"}]}}
+            return original(method, path, params, body, **kwargs)
+        self.client.request = request
+        self._monitor_at().run_cycle()
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id).state, ExecutionIntentState.POSITION_CLOSED)
+
+    def test_protection_rejection_without_crossed_price_never_creates_close(self):
+        self._missed_tp_fixture(last="100")
+        original = self.client.request
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/position/trading-stop":
+                raise DemoExecutionError("trading_stop_unavailable", "Rejected", exchange_code=110092)
+            return original(method, path, params, body, **kwargs)
+        self.client.request = request
+        with self.assertRaises(DemoExecutionError) as raised:
+            self._monitor_at().run_cycle()
+        self.assertEqual(raised.exception.exchange_code, 110092)
+        self.assertIsNone(self.execution_repository.find_close(self.entry.risk_reservation_id))
+        self.assertFalse(any(path == "/v5/order/create" for _, path, _ in self.client.calls))
+
+    def test_crossed_tp_long_short_boundary_and_invalid_quote_fail_closed(self):
+        for direction, side, last, crossed in (
+            (Direction.LONG, "Buy", "101.2", True),
+            (Direction.SHORT, "Sell", "98.8", True),
+            (Direction.LONG, "Buy", "101.1", False),
+            (Direction.SHORT, "Sell", "98.9", False),
+            (Direction.LONG, "Buy", "NaN", False),
+        ):
+            with self.subTest(direction=direction, last=last):
+                entry = replace(self.entry, direction=direction, fill_take_profit_rate=Decimal("0.012"))
+                # Independent repository keeps each subcase's immutable plan intact.
+                repo = SQLiteDemoExecutionRepository(Path(self.directory.name) / f"quote-{side}-{last}.sqlite3")
+                repo.initialize(); repo.save_planned(entry)
+                self.client = FakeExecutionClient()
+                original = self.client.request
+                def request(method, path, params=None, body=None, **kwargs):
+                    if path == "/v5/market/tickers":
+                        return {"result": {"list": [{"symbol": "BTCUSDT", "lastPrice": last}]}}
+                    payload = original(method, path, params, body, **kwargs)
+                    if path == "/v5/execution/list":
+                        payload["result"]["list"][0].update(side=side, execPrice="100")
+                    if path == "/v5/position/list":
+                        payload["result"]["list"][0].update(side=side, takeProfit="101.2" if side == "Buy" else "98.8", stopLoss="97")
+                    return payload
+                self.client.request = request
+                service = DemoExecutionService(self.client, repo, RULES)
+                self.client.calls.clear()
+                if crossed or last == "NaN":
+                    with self.assertRaises(DemoExecutionError) as raised:
+                        service.reconcile(entry.intent_id)
+                    self.assertEqual(raised.exception.code, "take_profit_crossed" if crossed else "malformed_response")
+                    self.assertFalse(any(method == "POST" for method, _, _ in self.client.calls))
+                else:
+                    self.assertEqual(service.reconcile(entry.intent_id).state, ExecutionIntentState.PROTECTION_VERIFIED)
+
+    def test_monitor_error_does_not_starve_later_intents_and_remains_failed(self):
+        other = replace(self.entry, intent_id="other-intent", order_link_id="trd-demo-e-other")
+        self.execution_repository.save_planned(self.entry)
+        self.execution_repository.save_planned(other)
+        self.service.submit(self.entry)
+        self.service.submit(other)
+        with patch.object(DemoExecutionService, "reconcile", side_effect=DemoExecutionError("trading_stop_unavailable", "Rejected")) as call:
+            with self.assertRaises(DemoExecutionError):
+                self._monitor_at().run_cycle()
+        self.assertEqual(call.call_count, 2)
+
     def test_fill_price_tp_long_short_and_restart_leave_source_levels_unchanged(self):
         for direction, side, price, expected, source_tp, source_sl in (
             (Direction.LONG, "Buy", "100.5", "101.7", "100.8", "97"),
@@ -218,6 +428,7 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
                           if endpoint == "/v5/position/trading-stop"]
                 self.assertEqual(posted[-1]["takeProfit"], expected)
                 self.assertEqual(posted[-1]["stopLoss"], source_sl)
+                self.assertEqual(posted[-1]["tpTriggerBy"], "LastPrice")
                 reopened = SQLiteDemoExecutionRepository(path)
                 self.assertEqual(reopened.save_planned(entry), result)
                 client.calls.clear()
@@ -280,6 +491,7 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
         self.assertEqual(result.effective_take_profit, Decimal("100.8"))
         self.assertEqual(result.stop_loss, Decimal("97"))
         self.assertEqual(self.execution_repository.save_planned(self.entry), result)
+        self.assertFalse(any(path == "/v5/market/tickers" for _, path, _ in self.client.calls))
 
     def test_operator_close_does_not_retain_stale_partial_fill_vwap(self):
         for prices_available in (True, False):

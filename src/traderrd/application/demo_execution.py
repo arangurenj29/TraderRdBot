@@ -342,7 +342,8 @@ class DemoExecutionService:
             )
         return self._unresolved(intent, "unexpected_filled_intent_kind")
 
-    def _reconcile_entry_order(self, intent: ExecutionIntent, order: dict[str, Any], *, protect: bool = True) -> ExecutionIntent:
+    def _reconcile_entry_order(self, intent: ExecutionIntent, order: dict[str, Any], *, protect: bool = True,
+                               explicit_ownership: bool = False) -> ExecutionIntent:
         status = order.get("orderStatus")
         quantity = _safe_decimal(order.get("cumExecQty"))
         if quantity == 0 and status in {"Cancelled", "Deactivated", "Rejected"}:
@@ -359,6 +360,13 @@ class DemoExecutionService:
         if not rows:
             return self._unresolved(intent, "incomplete_execution_evidence")
         identifiers = [row.get("execId") for row in rows]
+        if explicit_ownership:
+            order_id = intent.exchange_order_id or order.get("orderId")
+            if (not isinstance(order_id, str) or not order_id
+                or any(row.get("symbol") != intent.symbol
+                       or row.get("orderLinkId") != intent.order_link_id
+                       or row.get("orderId") != order_id for row in rows)):
+                return self._unresolved(intent, "execution_ownership_incomplete")
         if (any(not isinstance(value, str) or not value for value in identifiers)
             or len(set(identifiers)) != len(identifiers)
             or any(row.get("orderLinkId", intent.order_link_id) != intent.order_link_id
@@ -405,7 +413,20 @@ class DemoExecutionService:
         )
         if not protect:
             return filled
-        self._set_and_verify_protection(filled)
+        try:
+            self._set_and_verify_protection(filled)
+        except DemoExecutionError as exc:
+            if exc.code != "take_profit_crossed" or status != "PartiallyFilled":
+                raise
+            # A reducer cannot race an entry remainder. Reconcile cumulative
+            # fills again after cancellation, including a changed VWAP/target.
+            self._client.request("POST", "/v5/order/cancel", body={
+                "category": "linear", "symbol": intent.symbol, "orderLinkId": intent.order_link_id,
+            })
+            final = self._find_order(intent)
+            if final.get("orderStatus") not in {"Filled", "Cancelled", "Deactivated", "PartiallyFilledCanceled"}:
+                return self._unresolved(filled, "partial_remainder_not_cancelled")
+            return self._reconcile_entry_order(filled, final)
         if status == "PartiallyFilled":
             self._client.request("POST", "/v5/order/cancel", body={
                 "category": "linear", "symbol": intent.symbol, "orderLinkId": intent.order_link_id,
@@ -421,7 +442,7 @@ class DemoExecutionService:
             "protection_verified", "exchange_side_tp_sl_no_live_remainder",
         )
 
-    def reconcile_for_operator_close(self, intent_id: str) -> ExecutionIntent:
+    def reconcile_for_operator_close(self, intent_id: str, *, explicit_ownership: bool = False) -> ExecutionIntent:
         """Prove terminal owned entry exposure without installing stale TP/SL."""
         entry = self._repository.get(intent_id)
         if entry is None or entry.kind is not ExecutionIntentKind.ENTRY:
@@ -434,7 +455,8 @@ class DemoExecutionService:
         order = self._find_order(entry)
         if order.get("orderStatus") not in {"Filled", "Cancelled", "Deactivated", "PartiallyFilledCanceled"}:
             raise DemoExecutionError("close_guard", "Confirm entry remainder cancelled before operator closure")
-        reconciled = self._reconcile_entry_order(entry, order, protect=False)
+        reconciled = self._reconcile_entry_order(entry, order, protect=False,
+                                                explicit_ownership=explicit_ownership)
         if reconciled.state not in {ExecutionIntentState.FILLED, ExecutionIntentState.POSITION_CLOSED_PENDING}:
             raise DemoExecutionError("close_guard", "Owned execution and position evidence do not agree")
         return reconciled
@@ -718,20 +740,30 @@ class DemoExecutionService:
         stop_loss = self._rules.normalize_entry_price(
             intent.stop_loss, intent.direction
         )
-        self._client.request(
-            "POST",
-            "/v5/position/trading-stop",
-            body={
-                "category": "linear",
-                "symbol": intent.symbol,
-                "takeProfit": canonical_decimal(take_profit),
-                "stopLoss": canonical_decimal(stop_loss),
-                "tpslMode": "Full",
-                "tpOrderType": "Market",
-                "slOrderType": "Market",
-                "positionIdx": 0,
-            },
-        )
+        self._check_take_profit_not_crossed(intent, take_profit)
+        body = {
+            "category": "linear",
+            "symbol": intent.symbol,
+            "takeProfit": canonical_decimal(take_profit),
+            "stopLoss": canonical_decimal(stop_loss),
+            "tpslMode": "Full",
+            "tpOrderType": "Market",
+            "slOrderType": "Market",
+            "positionIdx": 0,
+        }
+        if intent.fill_take_profit_rate is not None:
+            body["tpTriggerBy"] = "LastPrice"
+        try:
+            self._client.request("POST", "/v5/position/trading-stop", body=body)
+        except DemoExecutionError as rejection:
+            # Price may cross between the quote and the protection request.
+            # Rejection alone is never authority to close an owned position.
+            try:
+                self._check_take_profit_not_crossed(intent, take_profit)
+            except DemoExecutionError as quote_error:
+                if quote_error.code == "take_profit_crossed":
+                    raise
+            raise rejection
         position = self._position(intent.symbol)
         if (
             _safe_decimal(position.get("size")) != (intent.filled_quantity or intent.quantity)
@@ -742,6 +774,21 @@ class DemoExecutionService:
             raise DemoExecutionError(
                 "protection_verification", "Exchange-side TP or SL was not verified"
             )
+
+    def _check_take_profit_not_crossed(self, intent: ExecutionIntent, target: Decimal) -> None:
+        if intent.fill_take_profit_rate is None:
+            return
+        payload = self._client.request("GET", "/v5/market/tickers",
+            {"category": "linear", "symbol": intent.symbol}, private=False)
+        rows = _result_rows(payload)
+        if len(rows) != 1 or rows[0].get("symbol") != intent.symbol:
+            raise DemoExecutionError("ticker_evidence", "Exact-symbol trigger price unavailable")
+        price = _safe_decimal(rows[0].get("lastPrice"))
+        if price <= 0:
+            raise DemoExecutionError("ticker_evidence", "Positive trigger price unavailable")
+        if (intent.direction is Direction.LONG and price >= target
+                or intent.direction is Direction.SHORT and price <= target):
+            raise DemoExecutionError("take_profit_crossed", "Owned fill-derived take profit already reached")
 
     def _owned_entry(self, reservation_id: str) -> ExecutionIntent:
         entry = self._repository.find_entry(reservation_id)

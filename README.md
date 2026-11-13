@@ -7,6 +7,21 @@ execution-volume-weighted entry price**: multiply by `1.012` for LONG or `0.988`
 for SHORT, then normalize using the symbol's existing tick-size rules. The
 original signal stop loss is retained, not recalculated from the fill price.
 
+Opted-in entries use an explicit `LastPrice` TP trigger and a fresh exact-symbol
+Demo ticker before installing protection. If the tick-normalized target has
+already been reached (LONG at/above TP, SHORT at/below TP), the monitor requests
+the existing owned reduce-only market close instead of moving the target. It
+cancels any entry remainder and revalidates cumulative fills first. The durable
+`demo-tp-close` command reuses the normal close, flatness, closed-PnL attribution
+and risk-release safeguards; uncertain submissions are not resent. Legacy
+entries without the opt-in do not acquire this automatic recovery policy.
+
+A failed protection does not stop reconciliation of later owned intents, but
+the cycle still reports failure. Exchange rejections expose only the operation
+and numeric error code, never raw private response text. Missing/contradictory
+quotes or ownership evidence do not authorize a close. Installing this code
+locally does not apply recovery to an already-running server.
+
 The signal and original planned TP/SL remain available for audit. The opt-in
 rate and confirmed execution price are persisted separately; exchange protection
 and subsequent verification use the effective fill-derived TP. Each cumulative

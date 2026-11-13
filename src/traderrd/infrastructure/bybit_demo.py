@@ -30,9 +30,10 @@ DEMO_BASE_URL = "https://api-demo.bybit.com"
 
 
 class DemoExecutionError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, exchange_code: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.exchange_code = exchange_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,7 @@ class BybitV5DemoClient:
     _MAX_RESPONSE_BYTES = 2_000_000
     _SUPPORTED_REQUESTS = {
         ("GET", "/v5/market/time"): "market_time_unavailable",
+        ("GET", "/v5/market/tickers"): "ticker_unavailable",
         ("GET", "/v5/market/instruments-info"): "instrument_info_unavailable",
         ("GET", "/v5/account/info"): "account_info_unavailable",
         ("GET", "/v5/account/wallet-balance"): "wallet_balance_unavailable",
@@ -241,7 +243,8 @@ class BybitV5DemoClient:
                 )
             raise DemoExecutionError(
                 operation_code,
-                f"Demo Trading operation unavailable: {operation_code}",
+                f"Demo Trading operation unavailable: {operation_code}; exchange_code={payload['retCode']}",
+                exchange_code=payload["retCode"],
             )
         result = payload.get("result")
         if not isinstance(result, dict):
