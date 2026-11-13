@@ -35,6 +35,10 @@ and exchange reconciliation independently visible and restartable.
   fallback. An inverse pending signal cancels first; an inverse filled position
   closes reduce-only and must be confirmed flat before the opposite entry.
 - Expiry, inverse, pause, and kill cancellation requests never release risk.
+  Late cancellation plans for filled/protected parents reconcile the owned
+  exposure instead of blindly cancelling an executed entry. Already verified
+  TP/SL must remain untouched; a partial-entry remainder still requires proof
+  of cancellation and cumulative-fill reconciliation.
   Reuse the existing staged reversal until confirmed flat cancellation or close;
   a cancellation-racing inverse/kill fill requires an owned reduce-only close.
   A pause-racing fill keeps its protective exits. Never replay an unsent entry

@@ -15,7 +15,7 @@ from traderrd.application.demo_execution import (
     DemoExecutionService,
 )
 from traderrd.application.demo_monitor import DemoLifecycleMonitor, DemoMonitorError
-from traderrd.domain.bridge import DemoAccountOrder, DemoStrategyAccountSnapshot
+from traderrd.domain.bridge import DemoAccountOrder, DemoAccountPosition, DemoStrategyAccountSnapshot
 from traderrd.domain.execution import (
     ExecutionIntent,
     ExecutionIntentKind,
@@ -394,6 +394,108 @@ class DemoExecutionLifecycleTests(unittest.TestCase):
             with self.assertRaises(DemoExecutionError):
                 self._monitor_at().run_cycle()
         self.assertEqual(call.call_count, 2)
+
+    def _filled_parent_cancel(self, suffix="obsolete"):
+        plan = replace(self.entry, intent_id=f"cancel-{suffix}", order_link_id=f"trd-demo-x-{suffix}",
+                       risk_command_id=f"cancel-{suffix}", kind=ExecutionIntentKind.CANCEL_ENTRY,
+                       state=ExecutionIntentState.PLANNED, price=None, expires_at=None,
+                       exchange_order_id=None, filled_quantity=None, filled_entry_price=None)
+        return self.execution_repository.save_planned(plan)
+
+    def test_worker_reconciles_protected_parent_cancels_without_touching_exits(self):
+        from traderrd.application.demo_worker import DemoSignalWorker
+        from traderrd.infrastructure.bridge_repository import SQLiteDemoBridgeRepository
+        from traderrd.infrastructure.sqlite_repository import SQLiteSignalRepository
+        self._missed_tp_fixture(last="100")
+        self.client.position_rows = [{"positionIdx": 0, "size": "4.838", "side": "Buy",
+                                      "takeProfit": "101.2", "stopLoss": "97"}]
+        self._monitor_at().run_cycle()
+        before_entry = self.execution_repository.get(self.entry.intent_id)
+        plans = [self._filled_parent_cancel(str(index)) for index in range(3)]
+        risk = SQLiteRiskStateRepository(self.database_path)
+        before_risk = risk.load_state()
+        before_commands = risk.counts()
+        SQLiteSignalRepository(self.database_path).initialize()
+        snapshots = FakeSnapshotProvider(DemoStrategyAccountSnapshot(
+            equity=Decimal("1000"), captured_at=START + timedelta(minutes=3),
+            positions=(DemoAccountPosition("BTCUSDT", Direction.LONG, Decimal("4.838"),
+                take_profit=Decimal("101.2"), stop_loss=Decimal("97")),), orders=()))
+        def worker():
+            return DemoSignalWorker(SQLiteDemoBridgeRepository(self.database_path), risk,
+                self.execution_repository, snapshots, self.client, clock=lambda: snapshots.snapshot.captured_at)
+        self.client.calls.clear()
+        result = worker().run_cycle(apply=True)
+        restarted = worker().run_cycle(apply=True)
+        self._monitor_at().run_cycle()
+        self.assertEqual((result.orders_submitted, restarted.orders_submitted), (0, 0))
+        self.assertEqual(result.cursor, restarted.cursor)
+        self.assertEqual(self.execution_repository.planned_intents(), [])
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id), before_entry)
+        self.assertTrue(all(self.execution_repository.get(p.intent_id).state is ExecutionIntentState.FILLED for p in plans))
+        self.assertEqual(risk.counts(), before_commands)
+        self.assertEqual(risk.load_state().reservations, before_risk.reservations)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.client.calls))
+
+    def test_filled_parent_cancel_reconciles_fill_instead_of_cancelling_filled_order(self):
+        self.service.submit(self.entry)
+        self.service.reconcile(self.entry.intent_id)
+        self.execution_repository.transition(self.entry.intent_id, ExecutionIntentState.FILLED, "test", "crash before verification")
+        plan = self._filled_parent_cancel()
+        self.client.calls.clear()
+        result = self.service.submit(plan)
+        self.assertEqual(result.state, ExecutionIntentState.FILLED)
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id).state, ExecutionIntentState.PROTECTION_VERIFIED)
+        self.assertFalse(any(path in {"/v5/order/cancel", "/v5/order/create"} for _, path, _ in self.client.calls))
+
+    def test_working_parent_cancel_still_posts_cancellation(self):
+        self.service.submit(self.entry)
+        self.client.order_status = "New"
+        self.service.reconcile(self.entry.intent_id)
+        plan = self._filled_parent_cancel()
+        self.client.calls.clear()
+        result = self.service.submit(plan)
+        self.assertEqual(result.state, ExecutionIntentState.ACKNOWLEDGED)
+        posts = [(path, body) for method, path, body in self.client.calls if method == "POST"]
+        self.assertEqual(posts, [("/v5/order/cancel", {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": self.entry.order_link_id})])
+
+    def test_filled_partial_parent_cancel_reconciles_and_cancels_only_remainder(self):
+        self.service.submit(self.entry)
+        self.execution_repository.transition(self.entry.intent_id, ExecutionIntentState.FILLED, "test", "partial fill persisted")
+        original, cancelled = self.client.request, [False]
+        def request(method, path, params=None, body=None, **kwargs):
+            if path == "/v5/order/cancel":
+                cancelled[0] = True
+            payload = original(method, path, params, body, **kwargs)
+            if path in {"/v5/order/realtime", "/v5/order/history"}:
+                payload["result"]["list"][0].update(orderStatus="Cancelled" if cancelled[0] else "PartiallyFilled", cumExecQty="2")
+            if path == "/v5/execution/list":
+                payload["result"]["list"][0]["execQty"] = "2"
+            if path == "/v5/position/list":
+                payload["result"]["list"][0].update(size="2", takeProfit="100.8", stopLoss="97")
+            return payload
+        self.client.request = request
+        plan = self._filled_parent_cancel()
+        self.client.calls.clear()
+        result = self.service.submit(plan)
+        self.assertEqual(result.state, ExecutionIntentState.FILLED)
+        self.assertEqual(self.execution_repository.get(self.entry.intent_id).filled_quantity, Decimal("2"))
+        cancels = [body for _, path, body in self.client.calls if path == "/v5/order/cancel"]
+        self.assertEqual(cancels, [{"category": "linear", "symbol": "BTCUSDT", "orderLinkId": self.entry.order_link_id}])
+        self.assertFalse(any(path == "/v5/order/create" for _, path, _ in self.client.calls))
+        risk = SQLiteRiskStateRepository(self.database_path).load_state()
+        self.assertGreater(risk.reservations[self.entry.risk_reservation_id].reserved_risk, 0)
+
+    def test_protected_parent_cancel_with_mismatched_protection_stays_unresolved(self):
+        self.service.submit(self.entry)
+        self.service.reconcile(self.entry.intent_id)
+        plan = self._filled_parent_cancel()
+        self.client.position_rows = [{"positionIdx": 0, "size": "4.838", "side": "Buy", "takeProfit": "0", "stopLoss": "0"}]
+        self.client.calls.clear()
+        result = self.service.submit(plan)
+        self.assertEqual(result.state, ExecutionIntentState.RECONCILIATION_REQUIRED)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.client.calls))
+        risk = SQLiteRiskStateRepository(self.database_path).load_state()
+        self.assertGreater(risk.reservations[self.entry.risk_reservation_id].reserved_risk, 0)
 
     def test_fill_price_tp_long_short_and_restart_leave_source_levels_unchanged(self):
         for direction, side, price, expected, source_tp, source_sl in (

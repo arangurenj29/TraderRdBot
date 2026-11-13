@@ -22,6 +22,11 @@ and numeric error code, never raw private response text. Missing/contradictory
 quotes or ownership evidence do not authorize a close. Installing this code
 locally does not apply recovery to an already-running server.
 
+Late cancellation plans for filled or protected entries use existing fill
+reconciliation instead of cancelling an already-filled order. A protected
+position is checked read-only; its exits and reserved risk are preserved.
+An actual partial-entry remainder still follows the owned cancellation path.
+
 The signal and original planned TP/SL remain available for audit. The opt-in
 rate and confirmed execution price are persisted separately; exchange protection
 and subsequent verification use the effective fill-derived TP. Each cumulative

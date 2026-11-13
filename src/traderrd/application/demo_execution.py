@@ -174,6 +174,10 @@ class DemoExecutionService:
             response = self._client.request("POST", "/v5/order/create", body=payload)
         elif intent.kind is ExecutionIntentKind.CANCEL_ENTRY:
             entry = self._owned_entry(intent.risk_reservation_id)
+            if entry.state in {ExecutionIntentState.FILLED, ExecutionIntentState.PROTECTION_VERIFIED}:
+                # A late cancellation is fill reconciliation, not authority to
+                # cancel exits or release risk for an already owned position.
+                return self.reconcile(intent.intent_id)
             if entry.state in {ExecutionIntentState.PLANNED, ExecutionIntentState.CANCELLED} and not self._repository.has_submission_attempt(entry.intent_id):
                 self._repository.transition(entry.intent_id, ExecutionIntentState.CANCELLED,
                     "entry_cancelled_before_submission", "never_submitted_no_exposure")
